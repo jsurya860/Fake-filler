@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Fake Data Filler Pro",
+  "short_name": "FDF Pro",
+  "version": "1.0.0",
+  "description": "Intelligently fills forms with realistic fake data. Context-aware field detection, auto error recovery, and encrypted profiles.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.ts"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Fake Data Filler Pro",
+    "default_popup": "src/popup/index.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "commands": {
+    "trigger-fill": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+F",
+        "mac": "Command+Shift+F"
+      },
+      "description": "Fill forms with fake data"
+    }
+  },
+  "minimum_chrome_version": "102"
+}

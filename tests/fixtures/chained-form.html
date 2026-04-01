@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Chained Form Fixture — Complex Inputs</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: system-ui, -apple-system, sans-serif; background: #f4f6f9; padding: 30px; }
+      h1 { text-align: center; margin-bottom: 6px; }
+      .subtitle { text-align: center; color: #555; margin-bottom: 24px; font-size: .95em; }
+      #wizard { max-width: 640px; margin: 0 auto; }
+      .step { background: #fff; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 28px 32px; margin-bottom: 16px; }
+      .step h2 { font-size: 1.25em; margin-bottom: 18px; border-bottom: 2px solid #3b82f6; padding-bottom: 8px; }
+      .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      .form-grid.full { grid-template-columns: 1fr; }
+      .form-group { display: flex; flex-direction: column; }
+      .form-group label { font-weight: 600; font-size: .88em; margin-bottom: 4px; color: #374151; }
+      .form-group input, .form-group select, .form-group textarea {
+        padding: 8px 10px; border: 1.5px solid #d1d5db; border-radius: 5px; font-size: .92em; font-family: inherit;
+      }
+      .form-group textarea { min-height: 60px; resize: vertical; }
+      .checkbox-group, .radio-group { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+      .checkbox-item, .radio-item { display: flex; align-items: center; gap: 8px; }
+      .checkbox-item label, .radio-item label { font-weight: 400; margin: 0; }
+      input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; }
+      .controls { margin-top: 18px; display: flex; justify-content: flex-end; gap: 10px; }
+      .controls button { padding: 10px 28px; font-size: .95em; font-weight: 600; border: none; border-radius: 6px; cursor: pointer; }
+      .next { background: #3b82f6; color: #fff; }
+      .next:hover { background: #2563eb; }
+      #finish { background: #059669; color: #fff; }
+      #finish:hover { background: #047857; }
+      .step-indicator { text-align: center; margin-bottom: 18px; font-size: .85em; color: #6b7280; }
+      .req { color: #dc2626; margin-left: 2px; }
+      @media (max-width: 600px) { .form-grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <h1>Chained Form (Wizard) Fixture</h1>
+    <p class="subtitle">5-step wizard with complex input types — text, email, password, tel, url, date, time, datetime-local, month, week, number, range, select, radio, checkbox, textarea</p>
+    <div class="step-indicator" id="stepIndicator">Step 1 of 5</div>
+
+    <div id="wizard">
+
+      <!-- ===== STEP 1: Account & Profile ===== -->
+      <form id="step-1" class="step" data-step="1">
+        <h2>Step 1 — Account &amp; Profile</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Full Name<span class="req">*</span></label>
+            <input type="text" name="fullName" required minlength="3" maxlength="100" />
+          </div>
+          <div class="form-group">
+            <label>Username<span class="req">*</span></label>
+            <input type="text" name="username" required pattern="^[a-zA-Z0-9_]{3,30}$" />
+          </div>
+          <div class="form-group">
+            <label>Email<span class="req">*</span></label>
+            <input type="email" name="email" required />
+          </div>
+          <div class="form-group">
+            <label>Alternative Email</label>
+            <input type="email" name="altEmail" />
+          </div>
+          <div class="form-group">
+            <label>Password<span class="req">*</span></label>
+            <input type="password" name="password" required minlength="8" />
+          </div>
+          <div class="form-group">
+            <label>Confirm Password<span class="req">*</span></label>
+            <input type="password" name="confirmPassword" required minlength="8" />
+          </div>
+          <div class="form-group">
+            <label>Date of Birth<span class="req">*</span></label>
+            <input type="date" name="dob" required />
+          </div>
+          <div class="form-group">
+            <label>Age<span class="req">*</span></label>
+            <input type="number" name="age" required min="18" max="100" />
+          </div>
+          <div class="form-group">
+            <label>Phone<span class="req">*</span></label>
+            <input type="tel" name="phone" required />
+          </div>
+          <div class="form-group">
+            <label>Website</label>
+            <input type="url" name="website" />
+          </div>
+        </div>
+        <div class="controls"><button type="button" class="next">Next &rarr;</button></div>
+      </form>
+
+      <!-- ===== STEP 2: Address & Location ===== -->
+      <form id="step-2" class="step" data-step="2" style="display:none">
+        <h2>Step 2 — Address &amp; Location</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Street Address<span class="req">*</span></label>
+            <input type="text" name="street" required minlength="5" maxlength="150" />
+          </div>
+          <div class="form-group">
+            <label>City<span class="req">*</span></label>
+            <input type="text" name="city" required />
+          </div>
+          <div class="form-group">
+            <label>State / Province<span class="req">*</span></label>
+            <input type="text" name="state" required />
+          </div>
+          <div class="form-group">
+            <label>Postal Code<span class="req">*</span></label>
+            <input type="text" name="postal" required pattern="^[0-9]{5,10}$" />
+          </div>
+          <div class="form-group">
+            <label>Country<span class="req">*</span></label>
+            <select name="country" required>
+              <option value="">-- Select --</option>
+              <option value="US">United States</option>
+              <option value="UK">United Kingdom</option>
+              <option value="IN">India</option>
+              <option value="AU">Australia</option>
+              <option value="CA">Canada</option>
+              <option value="DE">Germany</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Latitude</label>
+            <input type="number" name="latitude" min="-90" max="90" step="0.000001" />
+          </div>
+          <div class="form-group">
+            <label>Longitude</label>
+            <input type="number" name="longitude" min="-180" max="180" step="0.000001" />
+          </div>
+        </div>
+        <div class="controls"><button type="button" class="next">Next &rarr;</button></div>
+      </form>
+
+      <!-- ===== STEP 3: Professional & Financial ===== -->
+      <form id="step-3" class="step" data-step="3" style="display:none">
+        <h2>Step 3 — Professional &amp; Financial</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Job Title<span class="req">*</span></label>
+            <input type="text" name="jobTitle" required />
+          </div>
+          <div class="form-group">
+            <label>Company<span class="req">*</span></label>
+            <input type="text" name="company" required />
+          </div>
+          <div class="form-group">
+            <label>Industry<span class="req">*</span></label>
+            <select name="industry" required>
+              <option value="">-- Select --</option>
+              <option value="IT">Information Technology</option>
+              <option value="Finance">Finance</option>
+              <option value="Healthcare">Healthcare</option>
+              <option value="Education">Education</option>
+              <option value="Other">Other</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Experience (years)<span class="req">*</span></label>
+            <input type="number" name="experience" required min="0" max="70" />
+          </div>
+          <div class="form-group">
+            <label>Employment Status<span class="req">*</span></label>
+            <select name="employmentStatus" required>
+              <option value="">-- Select --</option>
+              <option value="employed">Employed</option>
+              <option value="self_employed">Self-Employed</option>
+              <option value="unemployed">Unemployed</option>
+              <option value="student">Student</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Salary Expectation</label>
+            <input type="number" name="salary" min="0" max="9999999" step="1000" />
+          </div>
+          <div class="form-group">
+            <label>Work Email<span class="req">*</span></label>
+            <input type="email" name="workEmail" required />
+          </div>
+          <div class="form-group">
+            <label>Work Phone</label>
+            <input type="tel" name="workPhone" />
+          </div>
+          <div class="form-group">
+            <label>Credit Card</label>
+            <input type="text" name="creditCard" pattern="^[0-9]{13,19}$" />
+          </div>
+          <div class="form-group">
+            <label>Card Expiry (MM/YY)</label>
+            <input type="text" name="cardExpiry" pattern="^(0[1-9]|1[0-2])\/[0-9]{2}$" />
+          </div>
+          <div class="form-group">
+            <label>CVV</label>
+            <input type="text" name="cvv" pattern="^[0-9]{3,4}$" />
+          </div>
+          <div class="form-group">
+            <label>Currency<span class="req">*</span></label>
+            <select name="currency" required>
+              <option value="">-- Select --</option>
+              <option value="USD">USD</option>
+              <option value="EUR">EUR</option>
+              <option value="GBP">GBP</option>
+              <option value="INR">INR</option>
+            </select>
+          </div>
+        </div>
+        <div class="controls"><button type="button" class="next">Next &rarr;</button></div>
+      </form>
+
+      <!-- ===== STEP 4: Preferences, Dates & Scheduling ===== -->
+      <form id="step-4" class="step" data-step="4" style="display:none">
+        <h2>Step 4 — Preferences &amp; Scheduling</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Preferred Language<span class="req">*</span></label>
+            <select name="prefLanguage" required>
+              <option value="">-- Select --</option>
+              <option value="en">English</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="hi">Hindi</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Timezone<span class="req">*</span></label>
+            <select name="timezone" required>
+              <option value="">-- Select --</option>
+              <option value="UTC-8">PST (UTC-8)</option>
+              <option value="UTC-5">EST (UTC-5)</option>
+              <option value="UTC+0">GMT (UTC+0)</option>
+              <option value="UTC+5:30">IST (UTC+5:30)</option>
+              <option value="UTC+8">CST (UTC+8)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Availability<span class="req">*</span></label>
+            <select name="availability" required>
+              <option value="">-- Select --</option>
+              <option value="full_time">Full-time</option>
+              <option value="part_time">Part-time</option>
+              <option value="contract">Contract</option>
+              <option value="freelance">Freelance</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Notice Period (days)<span class="req">*</span></label>
+            <input type="number" name="noticePeriod" required min="0" max="365" />
+          </div>
+          <div class="form-group">
+            <label>Interview Date<span class="req">*</span></label>
+            <input type="date" name="interviewDate" required />
+          </div>
+          <div class="form-group">
+            <label>Interview Time<span class="req">*</span></label>
+            <input type="time" name="interviewTime" required />
+          </div>
+          <div class="form-group">
+            <label>Start Date<span class="req">*</span></label>
+            <input type="date" name="startDate" required />
+          </div>
+          <div class="form-group">
+            <label>Available From</label>
+            <input type="datetime-local" name="availableFrom" />
+          </div>
+          <div class="form-group">
+            <label>Contract Month</label>
+            <input type="month" name="contractMonth" />
+          </div>
+          <div class="form-group">
+            <label>Project Week</label>
+            <input type="week" name="projectWeek" />
+          </div>
+          <div class="form-group">
+            <label>Technical Skills</label>
+            <input type="range" name="technicalSkills" min="0" max="100" value="50" />
+          </div>
+          <div class="form-group">
+            <label>Communication Skills</label>
+            <input type="range" name="communicationSkills" min="0" max="100" value="50" />
+          </div>
+        </div>
+
+        <!-- Radios & checkboxes in this step -->
+        <div class="form-grid" style="margin-top:14px">
+          <div class="form-group">
+            <label>Willing to Relocate<span class="req">*</span></label>
+            <div class="radio-group">
+              <div class="radio-item"><input type="radio" name="relocate" value="yes" id="relocYes" required /><label for="relocYes">Yes</label></div>
+              <div class="radio-item"><input type="radio" name="relocate" value="no" id="relocNo" /><label for="relocNo">No</label></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Work Mode<span class="req">*</span></label>
+            <div class="radio-group">
+              <div class="radio-item"><input type="radio" name="workMode" value="remote" id="wmRemote" required /><label for="wmRemote">Remote</label></div>
+              <div class="radio-item"><input type="radio" name="workMode" value="onsite" id="wmOnsite" /><label for="wmOnsite">On-site</label></div>
+              <div class="radio-item"><input type="radio" name="workMode" value="hybrid" id="wmHybrid" /><label for="wmHybrid">Hybrid</label></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Notifications</label>
+            <div class="checkbox-group">
+              <div class="checkbox-item"><input type="checkbox" name="notifications" value="email" id="notifEmail" /><label for="notifEmail">Email</label></div>
+              <div class="checkbox-item"><input type="checkbox" name="notifications" value="sms" id="notifSMS" /><label for="notifSMS">SMS</label></div>
+              <div class="checkbox-item"><input type="checkbox" name="notifications" value="push" id="notifPush" /><label for="notifPush">Push</label></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Languages Known</label>
+            <div class="checkbox-group">
+              <div class="checkbox-item"><input type="checkbox" name="languages" value="English" id="langEng" /><label for="langEng">English</label></div>
+              <div class="checkbox-item"><input type="checkbox" name="languages" value="Spanish" id="langSpa" /><label for="langSpa">Spanish</label></div>
+              <div class="checkbox-item"><input type="checkbox" name="languages" value="French" id="langFre" /><label for="langFre">French</label></div>
+              <div class="checkbox-item"><input type="checkbox" name="languages" value="Mandarin" id="langMan" /><label for="langMan">Mandarin</label></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Textarea -->
+        <div class="form-grid full" style="margin-top:14px">
+          <div class="form-group">
+            <label>Biography</label>
+            <textarea name="biography" maxlength="500" placeholder="Tell us about yourself..."></textarea>
+          </div>
+        </div>
+
+        <div class="controls"><button type="button" class="next">Next &rarr;</button></div>
+      </form>
+
+      <!-- ===== STEP 5: Documents, Numeric & Legal ===== -->
+      <form id="step-5" class="step" data-step="5" style="display:none">
+        <h2>Step 5 — Documents, Metrics &amp; Legal</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Passport Number<span class="req">*</span></label>
+            <input type="text" name="passportNumber" required pattern="^[A-Z0-9]{6,20}$" />
+          </div>
+          <div class="form-group">
+            <label>Passport Expiry<span class="req">*</span></label>
+            <input type="date" name="passportExpiry" required />
+          </div>
+          <div class="form-group">
+            <label>Driving License</label>
+            <input type="text" name="drivingLicense" pattern="^[A-Z0-9]{5,20}$" />
+          </div>
+          <div class="form-group">
+            <label>License Expiry</label>
+            <input type="date" name="licenseExpiry" />
+          </div>
+          <div class="form-group">
+            <label>National ID<span class="req">*</span></label>
+            <input type="text" name="nationalId" required pattern="^[0-9\-]{11,25}$" />
+          </div>
+          <div class="form-group">
+            <label>SSN</label>
+            <input type="text" name="ssn" pattern="^[0-9]{3}-[0-9]{2}-[0-9]{4}$" />
+          </div>
+        </div>
+
+        <!-- Numeric fields -->
+        <div class="form-grid" style="margin-top:14px">
+          <div class="form-group">
+            <label>Budget ($)</label>
+            <input type="number" name="budget" min="0" max="9999999" step="100" />
+          </div>
+          <div class="form-group">
+            <label>Team Size<span class="req">*</span></label>
+            <input type="number" name="teamSize" required min="1" max="1000" />
+          </div>
+          <div class="form-group">
+            <label>Projects Completed</label>
+            <input type="number" name="projectsCompleted" min="0" max="10000" />
+          </div>
+          <div class="form-group">
+            <label>Success Rate (%)</label>
+            <input type="number" name="successRate" min="0" max="100" step="0.01" />
+          </div>
+          <div class="form-group">
+            <label>Satisfaction Score</label>
+            <input type="number" name="satisfactionScore" min="1" max="10" step="0.5" />
+          </div>
+          <div class="form-group">
+            <label>Years in Role</label>
+            <input type="number" name="yearsInRole" min="0" max="70" step="0.5" />
+          </div>
+        </div>
+
+        <!-- Visibility & data-sharing radios -->
+        <div class="form-grid" style="margin-top:14px">
+          <div class="form-group">
+            <label>Profile Visibility<span class="req">*</span></label>
+            <div class="radio-group">
+              <div class="radio-item"><input type="radio" name="visibility" value="public" id="visPublic" required /><label for="visPublic">Public</label></div>
+              <div class="radio-item"><input type="radio" name="visibility" value="private" id="visPrivate" /><label for="visPrivate">Private</label></div>
+              <div class="radio-item"><input type="radio" name="visibility" value="friends" id="visFriends" /><label for="visFriends">Friends Only</label></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Data Sharing<span class="req">*</span></label>
+            <div class="radio-group">
+              <div class="radio-item"><input type="radio" name="dataSharing" value="full" id="dataFull" required /><label for="dataFull">Full</label></div>
+              <div class="radio-item"><input type="radio" name="dataSharing" value="limited" id="dataLimited" /><label for="dataLimited">Limited</label></div>
+              <div class="radio-item"><input type="radio" name="dataSharing" value="none" id="dataNone" /><label for="dataNone">None</label></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Legal checkboxes -->
+        <div class="form-grid full" style="margin-top:14px">
+          <div class="form-group">
+            <div class="checkbox-item"><input type="checkbox" name="terms" id="termsAccept" required /><label for="termsAccept">I agree to Terms &amp; Conditions<span class="req">*</span></label></div>
+          </div>
+          <div class="form-group">
+            <div class="checkbox-item"><input type="checkbox" name="privacy" id="privacyAccept" required /><label for="privacyAccept">I accept Privacy Policy<span class="req">*</span></label></div>
+          </div>
+          <div class="form-group">
+            <div class="checkbox-item"><input type="checkbox" name="dataProcessing" id="dataProcessingAccept" /><label for="dataProcessingAccept">I consent to data processing</label></div>
+          </div>
+          <div class="form-group">
+            <div class="checkbox-item"><input type="checkbox" name="ageConfirm" id="ageConfirm" required /><label for="ageConfirm">I confirm I am 18+<span class="req">*</span></label></div>
+          </div>
+        </div>
+
+        <!-- Final textarea -->
+        <div class="form-grid full" style="margin-top:14px">
+          <div class="form-group">
+            <label>Additional Comments</label>
+            <textarea name="comments" maxlength="1000" placeholder="Any additional information..."></textarea>
+          </div>
+        </div>
+
+        <div class="controls"><button type="button" id="finish">Finish &#10003;</button></div>
+      </form>
+
+    </div><!-- /wizard -->
+
+    <script>
+      (function () {
+        let current = 0;
+        const steps = Array.from(document.querySelectorAll('.step'));
+        const indicator = document.getElementById('stepIndicator');
+
+        function show(i) {
+          steps.forEach((s, idx) => { s.style.display = idx === i ? '' : 'none'; });
+          if (indicator) indicator.textContent = `Step ${i + 1} of ${steps.length}`;
+          try {
+            history.pushState({ step: i }, '', `#step${i + 1}`);
+          } catch (e) { /* ignore */ }
+          window.dispatchEvent(new CustomEvent('wizard-step-changed', { detail: { step: i + 1 } }));
+        }
+
+        document.querySelectorAll('.next').forEach((btn, idx) => {
+          btn.addEventListener('click', () => {
+            current = Math.min(steps.length - 1, idx + 1);
+            show(current);
+          });
+        });
+
+        document.getElementById('finish').addEventListener('click', () => {
+          alert('All steps completed!');
+        });
+
+        window.addEventListener('popstate', (e) => {
+          const s = (e.state && typeof e.state.step === 'number') ? e.state.step : 0;
+          show(s);
+        });
+
+        // expose a helper for tests to advance programmatically
+        window.__advanceWizard = (n = 1) => {
+          current = Math.min(steps.length - 1, current + n);
+          show(current);
+        };
+
+        show(0);
+      })();
+    </script>
+  </body>
+</html>
