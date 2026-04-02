@@ -8,7 +8,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = {
   locale: 'en-US',
   defaultEmailDomain: 'testdomain.com',
   fillSensitivity: 'balanced',
-  errorRecoveryEnabled: true,
+  errorRecoveryEnabled: false,
   privacyMode: false,
   domainWhitelist: [],
   domainBlacklist: ['paypal.com', 'bankofamerica.com', 'chase.com', 'wellsfargo.com'],
@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = {
   chainingDelayMs: 500,
   autoSubmitOnChaining: false,
   radioDiagnostics: false,
-  autoFillModals: true,
+  autoFillModals: false,
 };
 
 // =============================================================

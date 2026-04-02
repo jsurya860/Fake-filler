@@ -429,19 +429,38 @@ function createModalBadge(modal: HTMLElement, label: string, href?: string): HTM
     e.preventDefault();
     try {
       if (label === 'Copy payment data') {
-        // Attempt to generate payment data for this modal and copy to clipboard.
         try { await handleCopyPaymentForModal(modal, href); } catch (err) { console.debug('[FDF Pro] copy payment data failed', err); }
         return;
       }
-      // For other Copy payment variants (JSON/single), prevent the default
-      // behaviour (which would open href) so their custom listeners can run.
+      if (label === 'Fill now' || label === 'Fill Modal') {
+        try {
+          // Analyze and fill the modal container or the form inside it
+          const modalFormEl = modal.querySelector('form') as HTMLElement | null;
+          let fa: FormAnalysis;
+          if (modalFormEl) {
+            fa = detector.analyzeForm(modalFormEl);
+          } else {
+            fa = buildFormAnalysisFromContainer(modal);
+          }
+
+          if (fa.fields.length > 0) {
+            const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
+            if (genResp && (genResp as any).success && (genResp as any).data) {
+              const enriched = (genResp as any).data as FormAnalysis;
+              hotkeyFillInProgress = true;
+              try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } finally { hotkeyFillInProgress = false; }
+            }
+          }
+        } catch (err) { console.debug('[FDF Pro] badge fill failed', err); }
+        return;
+      }
       if (label.startsWith('Copy payment')) {
         return;
       }
-      if (href) {
+      if (href && !href.startsWith('#')) {
         window.open(href, '_blank');
       } else {
-        modal.focus();
+        try { (modal as HTMLElement).focus?.(); } catch {}
       }
     } catch { /* ignore */ }
   });
@@ -593,6 +612,15 @@ function getOpenModalsIncludingPaymentIframes(): HTMLElement[] {
         if ((el as HTMLElement).offsetParent === null) return false;
         const style = window.getComputedStyle(el);
         if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+
+        // For generic class-based matches (.modal, .popup etc), require they actually
+        // look like an overlay (fixed/absolute and high z-index) or are <dialog>.
+        const tag = el.tagName.toLowerCase();
+        if (tag !== 'dialog' && el.getAttribute('role') !== 'dialog' && el.getAttribute('role') !== 'alertdialog') {
+          const isOverlay = style.position === 'fixed' || style.position === 'absolute';
+          const zIndex = parseInt(style.zIndex, 10);
+          if (!isOverlay || isNaN(zIndex) || zIndex < 10) return false;
+        }
       } catch {}
       return true;
     });
@@ -718,70 +746,31 @@ async function checkAndFillModals(): Promise<void> {
 
   if (!autoFillModals) return;
 
-  // NOTE: By design we do NOT auto-fill detected modal forms. Auto-filling
-  // forms rendered inside modal overlays can target the wrong inputs or
-  // interact with cross-origin payment frames. Keep detecting modals and
-  // injecting helpful UI (e.g., 'Open payment' badge), but skip any
-  // automated fill actions here. Manual fills (hotkey/popup) still work
-  // and are guarded elsewhere.
-  //
-  // EXCEPTION: when a modal contains a same-origin form (not inside a
-  // cross-origin iframe) and the autoFillModals setting is enabled,
-  // auto-fill it. This handles chained modal flows where the second
-  // modal contains the actual form.
+  // NOTE: By design we do NOT auto-fill every detected modal. Auto-filling
+  // forms rendered inside modal overlays can target the wrong inputs.
+  // We ONLY inject helpful badges. The user must click 'Fill now' to fill.
   try {
     for (const modal of openModals) {
       try {
-        // Log truncated outerHTML for debugging
-        try { console.info('[FDF Pro] detected modal outerHTML (truncated):', modal.outerHTML.slice(0, 800)); } catch {}
-
         const iframe = modal.querySelector('iframe');
         if (iframe instanceof HTMLIFrameElement) {
           const src = iframe.getAttribute('src') || iframe.src || undefined;
           createModalBadge(modal, 'Open payment', src);
           createCopyBadges(modal, src);
-          try { console.info('[FDF Pro] modal contains iframe — injected Open payment badge'); } catch {}
           continue;
         }
 
-        // Same-origin modal with a form — auto-fill it
+        // Same-origin modal with a form
         const hasInputs = modal.querySelector('input:not([type="hidden"]), textarea, select') !== null;
-        console.debug('[FDF Pro] checkAndFillModals: modal hasInputs=', hasInputs, 'tagName=', modal.tagName, 'id=', modal.id || '(none)');
         if (!hasInputs) {
-          try { (modal as HTMLElement).focus?.(); } catch {}
           continue;
         }
 
-        // Build fingerprint and skip if already filled
-        const inputEls = Array.from(modal.querySelectorAll<HTMLElement>('input:not([type="hidden"]), textarea, select'));
-        const fp = inputEls.map((el) => `${(el as HTMLInputElement).name || el.id}:${(el as HTMLInputElement).type || el.tagName}`).sort().join('|');
-        if (modalFilledHistory.has(fp)) continue;
+        // Inject badges for all detected modals. Auto-fill is DISABLED to ensure consent.
+        const src = (modal.id ? `#${modal.id}` : undefined);
+        createModalBadge(modal, 'Fill now', src);
+        createCopyBadges(modal, src);
 
-        // Find matching detected form, or build ad-hoc analysis
-        let formAnalysis: FormAnalysis | null = null;
-        const modalFormEl = modal.querySelector('form') as HTMLElement | null;
-        if (modalFormEl) {
-          formAnalysis = detector.analyzeForm(modalFormEl);
-        }
-        if (!formAnalysis || formAnalysis.fields.length === 0) {
-          formAnalysis = buildFormAnalysisFromContainer(modal);
-        }
-
-        if (!formAnalysis || formAnalysis.fields.length === 0) continue;
-
-        modalFillPending = true;
-        try {
-          const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis } }) as ExtensionResponse | { success: false; error: string };
-          if (genResp && (genResp as any).success && (genResp as any).data) {
-            const enriched = (genResp as any).data as FormAnalysis;
-            hotkeyFillInProgress = true;
-            try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } finally { hotkeyFillInProgress = false; }
-            modalFilledHistory.add(fp);
-            console.info('[FDF Pro] auto-filled modal form');
-          }
-        } finally {
-          modalFillPending = false;
-        }
       } catch {}
     }
   } catch {}
@@ -1053,8 +1042,17 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
       // Keep the mutation observer for server-side / post-submit errors.
       // During chaining, skip the error observer — it causes recovery loops
       // that repeatedly change field values on the current page.
+      // Keep the mutation observer for server-side / post-submit errors.
+      // During chaining, skip the error observer — it causes recovery loops
+      // that repeatedly change field values on the current page.
+      // ALSO: Only start if explicitly enabled in settings to avoid unwanted auto-fills.
       if (!chainingActive) {
-        startErrorObserver(formAnalysis.fields);
+        try {
+          const s = await sendMessageSafe({ action: 'GET_SETTINGS' });
+          if (s && s.success && s.data?.errorRecoveryEnabled) {
+            startErrorObserver(formAnalysis.fields);
+          }
+        } catch {}
       }
 
       // Send a short confirmation payload back to the background so
@@ -1587,6 +1585,18 @@ function startErrorObserver(fields: FieldAnalysis[]): void {
 }
 
 async function notifyBackgroundOfErrors(fields: FieldAnalysis[]): Promise<void> {
+  // Respect user consent for automatic error recovery.
+  try {
+    const s = await sendMessageSafe({ action: 'GET_SETTINGS' });
+    if (!s || !s.success || !s.data || !s.data.errorRecoveryEnabled) {
+      if (activeErrorObserver) {
+        activeErrorObserver.disconnect();
+        activeErrorObserver = null;
+      }
+      return;
+    }
+  } catch { return; }
+
   const allErrors = collectErrorElements(fields);
   // Only send field-associated errors to avoid page-level noise
   const errorElements = allErrors.filter((e) => (e.nearFieldName && e.nearFieldName.length > 0) || (e.nearFieldId && e.nearFieldId.length > 0));
@@ -1766,26 +1776,18 @@ void (async () => {
       // Skip while a fill is in progress to avoid re-triggering from our own DOM mutations.
       // Also skip if a chain fill request is already pending/being processed.
       if (chainingActive && !isFilling && !chainFillPending && cachedForms.length > 0) {
+        // NOTE: By user request, we do NOT auto-fill forms purely based on DOM mutations.
+        // Chaining will only proceed if the user clicked Next/Submit on the previous page
+        // (which is handled by the background's onUpdated/onCommitted navigation listeners)
+        // or if they explicitly press the hotkey on the current page.
+        // Automatic chaining from MutationObserver was too aggressive and could target
+        // unrelated modals.
+        /* 
         const fp = formFingerprint(cachedForms.flatMap((f) => f.fields));
-        // Skip if this fingerprint matches the last filled form OR any
-        // previously filled form in this chaining session (prevents loops
-        // when wizard steps cycle back to an earlier form).
         if (fp !== lastFilledFingerprint && !filledFingerprintHistory.has(fp)) {
-          lastFilledFingerprint = fp;
-          chainFillPending = true;
-          console.info('[FDF Pro] chaining: new form detected via SPA mutation, requesting chain fill');
-          // Apply chainingDelayMs before sending the request so the page
-          // has time to settle (prevents rapid-fire fills on wizard forms).
-          setTimeout(() => {
-            // Re-check guards after the delay — state may have changed
-            if (!chainingActive || isFilling) {
-              chainFillPending = false;
-              return;
-            }
-            void sendMessageSafe({ action: 'CHAIN_FILL_REQUEST', payload: { forms: cachedForms } })
-              .finally(() => { chainFillPending = false; });
-          }, chainingDelayMs);
+           ... (disabled auto-trigger)
         }
+        */
       }
     }, LIMITS.ANALYSIS_DEBOUNCE_MS);
   });
@@ -1812,10 +1814,9 @@ void (async () => {
           try {
             const isModal = node.matches(MODAL_MATCH_COMBINED);
             const containsModal = node.querySelector(MODAL_MATCH_COMBINED) !== null;
-            // Also catch when a new node with form inputs is appended
-            // to the body (common with portals / React modals)
-            const hasInputs = node.querySelector('input, textarea, select') !== null;
-            if (isModal || containsModal || hasInputs) {
+            // Only trigger if we definitely found a modal-like element.
+            // Avoid triggering on every loose input addition to prevent recovery loops.
+            if (isModal || containsModal) {
               needsCheck = true;
               break;
             }
