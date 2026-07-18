@@ -3,118 +3,78 @@ import type {
   ExtensionResponse,
   FormAnalysis,
   FieldAnalysis,
+  Settings,
+  DetectErrorsResult,
 } from '@/shared/types';
 import { ERROR_SELECTORS, LIMITS } from '@/shared/constants';
 import { FormDetectionEngine } from './form-detection';
 import { FormFiller } from './form-filler';
+import { sendMessageSafe , logSwallowed } from '@/shared/messaging';
 import { matchesHostnameList } from '@/shared/utils';
 import { parseCanonicalHotkey } from '@/shared/hotkey';
 import { DEFAULT_SETTINGS } from '@/shared/constants';
-import { installApiInterceptor, onApiError } from './api-interceptor';
+import { API_ERROR_EVENT } from './api-interceptor';
 import type { ApiErrorEntry } from './api-interceptor';
-
-// Safe sendMessage wrapper to avoid uncaught runtime errors when the
-// background/service-worker is unavailable or the extension context is
-// being restarted. Returns an object similar to ExtensionResponse.
-/** Whether the extension context has been permanently invalidated (e.g. extension reloaded/unloaded). */
-let _contextInvalidated = false;
-
-let _swWakeRetryTimer: ReturnType<typeof setTimeout> | null = null;
-
-async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { success: false; error: string }> {
-  // Permanent context invalidation — stop all messaging.
-  if (_contextInvalidated) return { success: false, error: 'context-invalidated' } as any;
-  try {
-    // Some environments (tests) may not have chrome.runtime
-    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
-      // chrome.runtime.id is falsy only when the extension context is truly gone.
-      _contextInvalidated = true;
-      return { success: false, error: 'No runtime' } as any;
-    }
-    const res = await chrome.runtime.sendMessage(msg as any);
-    // On a successful send, clear any pending wake retry.
-    if (_swWakeRetryTimer) { clearTimeout(_swWakeRetryTimer); _swWakeRetryTimer = null; }
-    return res ?? ({ success: false, error: 'no-response' } as any);
-  } catch (err: any) {
-    const msg2 = String(err && err.message ? err.message : err);
-
-    // Permanent extension context invalidation — disable all future messaging.
-    if (/extension context invalidated/i.test(msg2)) {
-      _contextInvalidated = true;
-      return { success: false, error: msg2 } as any;
-    }
-
-    // Temporary SW sleep — the service worker was idle and Chrome killed it.
-    // Mark as sleeping and schedule a wake-up ping so the next real call
-    // succeeds. Do NOT set _contextInvalidated.
-    if (/no.+sw|service worker|receiving end does not exist/i.test(msg2)) {
-      // Wake the SW by sending a no-op ping. Use the raw API to avoid recursion.
-      if (!_swWakeRetryTimer) {
-        _swWakeRetryTimer = setTimeout(() => {
-          _swWakeRetryTimer = null;
-          try {
-            if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id) {
-              // Sending any message wakes the SW; ignore errors here.
-              chrome.runtime.sendMessage({ action: 'PING' } as any).then(() => {
-                // SW is back up; nothing more to do.
-              }).catch(() => { /* ignore */ });
-            }
-          } catch { /* ignore */ }
-        }, 300);
-      }
-      return { success: false, error: msg2 } as any;
-    }
-
-    return { success: false, error: msg2 } as any;
-  }
-}
 
 // Forward content-script console messages to background for popup debug panel
 (() => {
   try {
     const origConsole: Record<'log' | 'info' | 'warn' | 'error' | 'debug', (...a: unknown[]) => void> = {
+      // eslint-disable-next-line no-console -- capturing the native method reference, not calling it
       log: console.log.bind(console),
       info: console.info.bind(console),
       warn: console.warn.bind(console),
       error: console.error.bind(console),
+      // eslint-disable-next-line no-console -- fallback to native console.log if console.debug is unavailable
       debug: (console.debug ?? console.log).bind(console),
     };
 
     const levels: Array<'log' | 'info' | 'warn' | 'error' | 'debug'> = ['log', 'info', 'warn', 'error', 'debug'];
+    // Guard against recursive forwarding: sendMessageSafe may internally call
+    // console.debug on failure, which would cause an infinite call loop.
+    let _forwardingLog = false;
     for (const level of levels) {
       (console as unknown as Record<string, (...a: unknown[]) => void>)[level] = (...args: unknown[]) => {
-        origConsole[level](...args);
+        origConsole[level](...args); // always log locally first
+        if (_forwardingLog) return;  // prevent recursive forwarding
+        _forwardingLog = true;
         // Fire-and-forget: forward log to background debug panel.
-        // Explicitly suppress rejection so it never shows as "Uncaught (in promise)".
-        sendMessageSafe({ action: 'REPORT_DEBUG_LOG', payload: { ts: Date.now(), source: 'content', level, message: String(args[0] ?? ''), args } }).catch(() => { /* ignore */ });
+        // Reset the reentrancy guard once the async operation settles.
+        sendMessageSafe({ action: 'REPORT_DEBUG_LOG', payload: { ts: Date.now(), source: 'content', level, message: String(args[0] ?? ''), args } })
+          .catch(() => { /* ignore */ })
+          .finally(() => { _forwardingLog = false; });
       };
     }
     let lastHotkeyTs = 0;
     let parsedHotkeyGlobal = parseCanonicalHotkey(undefined);
+    /** Cached domain blacklist from settings. Refreshed alongside the hotkey. */
+    let cachedDomainBlacklist: string[] = [...(DEFAULT_SETTINGS.domainBlacklist)];
 
-    function shouldIgnoreForHotkey(): boolean {
+    const shouldIgnoreForHotkey = (): boolean => {
       const active = document.activeElement as HTMLElement | null;
       if (!active) return false;
       const tag = active.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea') return true;
       if (active.isContentEditable) return true;
       return false;
-    }
+    };
 
-    async function refreshHotkeyFromSettings(): Promise<void> {
+    const refreshHotkeyFromSettings = async (): Promise<void> => {
       try {
-        const resp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GET_SETTINGS' }) as ExtensionResponse | { success: false; error: string };
+        const resp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<Settings>>({ action: 'GET_SETTINGS' });
         if (!resp.success || !resp.data) return;
-        const s = resp.data as { oneClickHotkey?: string };
+        const s = resp.data;
         parsedHotkeyGlobal = parseCanonicalHotkey(s.oneClickHotkey);
-        try { console.debug('[FDF Pro] hotkey updated to', s.oneClickHotkey, parsedHotkeyGlobal); } catch {}
+        if (Array.isArray(s.domainBlacklist)) cachedDomainBlacklist = s.domainBlacklist;
+        try { console.debug('[FDF Pro] hotkey updated to', s.oneClickHotkey, parsedHotkeyGlobal); } catch (e) { logSwallowed('src/content/index.ts', e); }
       } catch (err) {
-        try { console.debug('[FDF Pro] failed to refresh hotkey', err); } catch {}
+        try { console.debug('[FDF Pro] failed to refresh hotkey', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
-    }
+    };
 
     // Single global keydown handler uses parsedHotkeyGlobal state
-    window.addEventListener('keydown', async (e) => {
+    window.addEventListener('keydown', (e) => {
+      void (async () => {
       try {
         const parsed = parsedHotkeyGlobal;
         if (!parsed || !parsed.key) return;
@@ -127,6 +87,12 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
         const key = (e.key || '').toLowerCase();
         if (!key) return;
         if (key !== parsed.key) return;
+        // Enforce domain blacklist — the popup fill path checks it, but the
+        // hotkey path previously bypassed it entirely.
+        if (cachedDomainBlacklist.length > 0 && matchesHostnameList(location.hostname, cachedDomainBlacklist)) {
+          try { console.debug('[FDF Pro] hotkey blocked: hostname on blacklist', location.hostname); } catch (e) { logSwallowed('src/content/index.ts', e); }
+          return;
+        }
         lastHotkeyTs = Date.now();
 
         // Prefer modal targets when present (hotkey should operate on modals)
@@ -156,9 +122,9 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
                   const formEl = doc.querySelector('form') as HTMLElement | null;
                   if (formEl) {
                     const fa = buildFormAnalysisFromIframe(formEl, doc, iframe);
-                    const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
-                    if (genResp && (genResp as any).success && (genResp as any).data) {
-                      const enriched = (genResp as any).data as FormAnalysis;
+                    const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } });
+                    if (genResp && genResp.success && genResp.data) {
+                      const enriched = genResp.data;
                       hotkeyFillInProgress = true;
                       try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } catch (err) { console.debug('[FDF Pro] hotkey modal fill failed', err); } finally { hotkeyFillInProgress = false; }
                       return;
@@ -179,7 +145,7 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
                   return;
                 }
               } catch (err) {
-                try { console.debug('[FDF Pro] failed reading stored payment', err); } catch {}
+                try { console.debug('[FDF Pro] failed reading stored payment', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
               }
 
               // Fallback: generate and copy now
@@ -195,9 +161,9 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
               const fa = detector.analyzeForm(formEl);
               if (fa.fields.length > 0) {
                 console.debug('[FDF Pro] hotkey: modal form has', fa.fields.length, 'fields');
-                const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
-                if (genResp && (genResp as any).success && (genResp as any).data) {
-                  const enriched = (genResp as any).data as FormAnalysis;
+                const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } });
+                if (genResp && genResp.success && genResp.data) {
+                  const enriched = genResp.data;
                   hotkeyFillInProgress = true;
                   try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } catch (err) { console.debug('[FDF Pro] hotkey modal fill failed', err); } finally { hotkeyFillInProgress = false; }
                 }
@@ -216,9 +182,9 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
               const fa = buildFormAnalysisFromContainer(modal);
               console.debug('[FDF Pro] hotkey: built ad-hoc analysis with', fa.fields.length, 'fields');
               if (fa.fields.length > 0) {
-                const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
-                if (genResp && (genResp as any).success && (genResp as any).data) {
-                  const enriched = (genResp as any).data as FormAnalysis;
+                const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } });
+                if (genResp && genResp.success && genResp.data) {
+                  const enriched = genResp.data;
                   hotkeyFillInProgress = true;
                   try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } catch (err) { console.debug('[FDF Pro] hotkey modal formless fill failed', err); } finally { hotkeyFillInProgress = false; }
                 }
@@ -233,14 +199,14 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
         if (!cachedForms || cachedForms.length === 0) return;
         const formToFill = cachedForms[0];
 
-        const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: formToFill } }) as ExtensionResponse | { success: false; error: string };
-        if (!genResp || !(genResp as any).success || !(genResp as any).data) return;
-        const enriched = (genResp as any).data as FormAnalysis;
+        const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: formToFill } });
+        if (!genResp || !genResp.success || !genResp.data) return;
+        const enriched = genResp.data;
 
         try {
           await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } });
         } catch (err) {
-          try { console.debug('[FDF Pro] hotkey fill failed', err); } catch {}
+          try { console.debug('[FDF Pro] hotkey fill failed', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
         }
 
         // Blur the active element so subsequent hotkey presses are not
@@ -251,8 +217,9 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
           if (ae && typeof ae.blur === 'function') ae.blur();
         } catch { /* ignore */ }
       } catch (err) {
-        try { console.debug('[FDF Pro] hotkey handler error', err); } catch {}
+        try { console.debug('[FDF Pro] hotkey handler error', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
+      })();
     });
 
     // Watch for settings changes in storage so hotkey updates without reload
@@ -260,11 +227,13 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
       chrome.storage.onChanged.addListener((changes) => {
         if (changes.settings) {
           try {
-            const newSettings = changes.settings.newValue as { oneClickHotkey?: string } | undefined;
+            const newSettings = changes.settings.newValue as { oneClickHotkey?: string; domainBlacklist?: string[] } | undefined;
             parsedHotkeyGlobal = parseCanonicalHotkey(newSettings?.oneClickHotkey);
-            try { console.debug('[FDF Pro] storage:onChanged hotkey updated', newSettings?.oneClickHotkey); } catch {}
+            const newBlacklist = newSettings?.domainBlacklist;
+            if (Array.isArray(newBlacklist)) cachedDomainBlacklist = newBlacklist;
+            try { console.debug('[FDF Pro] storage:onChanged hotkey updated', newSettings?.oneClickHotkey); } catch (e) { logSwallowed('src/content/index.ts', e); }
           } catch (e) {
-            try { console.debug('[FDF Pro] failed parsing hotkey in storage.onChanged', e); } catch {}
+            try { console.debug('[FDF Pro] failed parsing hotkey in storage.onChanged', e); } catch (e) { logSwallowed('src/content/index.ts', e); }
           }
         }
       });
@@ -276,7 +245,7 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
       void refreshHotkeyFromSettings();
     } catch {
       parsedHotkeyGlobal = parseCanonicalHotkey(DEFAULT_SETTINGS.oneClickHotkey);
-      try { console.debug('[FDF Pro] hotkey using fallback default', DEFAULT_SETTINGS.oneClickHotkey); } catch {}
+      try { console.debug('[FDF Pro] hotkey using fallback default', DEFAULT_SETTINGS.oneClickHotkey); } catch (e) { logSwallowed('src/content/index.ts', e); }
     }
 
   } catch (err) {
@@ -284,20 +253,29 @@ async function sendMessageSafe<T = unknown, R = any>(msg: T): Promise<R | { succ
   }
 })();
 
-// Global error capture: forward uncaught errors and unhandled promise rejections
+// Global error capture: forward uncaught errors and unhandled promise rejections.
+// Truncated to a bounded length before forwarding — these come from the host
+// page's own runtime errors and could otherwise carry incidental page context
+// (e.g. a value interpolated into an error message) into the debug-log buffer.
+const MAX_CAPTURED_ERROR_LEN = 500;
+function truncateForLog(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.length > MAX_CAPTURED_ERROR_LEN ? `${value.slice(0, MAX_CAPTURED_ERROR_LEN)}…` : value;
+}
+
 try {
   window.addEventListener('error', (evt: ErrorEvent) => {
     try {
-      const target = (evt as any).target as Element | undefined;
+      const target = evt.target as Element | null;
       const resource = target && (target as HTMLScriptElement).src ? (target as HTMLScriptElement).src : undefined;
       void sendMessageSafe({
         action: 'LOG_CONTENT_ERROR',
         payload: {
-          message: evt.message,
+          message: truncateForLog(evt.message),
           filename: evt.filename,
           lineno: evt.lineno,
           colno: evt.colno,
-          stack: (evt.error && (evt.error.stack ?? String(evt.error))) ?? null,
+          stack: truncateForLog(evt.error instanceof Error ? (evt.error.stack ?? String(evt.error)) : null),
           resource,
         },
       });
@@ -306,23 +284,26 @@ try {
 
   window.addEventListener('unhandledrejection', (evt: PromiseRejectionEvent) => {
     try {
-      const reason: any = (evt && (evt as any).reason) || null;
+      const reason: unknown = evt.reason;
+      const reasonMessage = reason instanceof Error ? reason.message : String(reason ?? 'Unhandled rejection');
+      const reasonStack = reason instanceof Error ? reason.stack : undefined;
       void sendMessageSafe({
         action: 'LOG_CONTENT_ERROR',
         payload: {
-          message: reason && reason.message ? reason.message : String(reason || 'Unhandled rejection'),
-          stack: reason && reason.stack ? reason.stack : null,
-          reason,
+          message: truncateForLog(reasonMessage),
+          stack: truncateForLog(reasonStack),
         },
       });
     } catch { /* ignore */ }
   });
 } catch { /* ignore */ }
 
-/** Produces a stable fingerprint for a set of fields so we can detect form changes. */
+/** Produces a stable fingerprint for a set of fields so we can detect form changes.
+ * Uses the CSS selector (stable) as the primary key, falling back to name.
+ * Avoids using field.id which is regenerated fresh on every detectForms() call. */
 function formFingerprint(fields: FieldAnalysis[]): string {
   return fields
-    .map((f) => `${f.name || f.id}:${f.htmlType}`)
+    .map((f) => `${f.selector || f.name || f.htmlType}:${f.htmlType}`)
     .sort()
     .join('|');
 }
@@ -339,14 +320,15 @@ let lastFilledFingerprint = '';
 /** Set of all fingerprints filled during this chaining session — prevents re-filling wizard steps we already completed. */
 const filledFingerprintHistory = new Set<string>();
 let isFilling = false;
-let chainFillPending = false;
+const chainFillPending = false;
 let pageObserverTimer: ReturnType<typeof setTimeout> | null = null;
 let errorObserverTimer: ReturnType<typeof setTimeout> | null = null;
 /** When true, the current FILL_FORM was triggered by the hotkey handler which
  *  already validated modal context — skip the modal-outside guard. */
 let hotkeyFillInProgress = false;
-/** Configured delay between chain steps (populated from settings). */
-let chainingDelayMs = 500;
+/** Configured delay between chain steps (populated from settings, applied by the background). */
+// Note: The actual delay is enforced by src/background/index.ts; this value is
+// fetched here only for potential future use in content-script-side logic.
 
 // -----------------------------------------------------------
 // Modal auto-fill state
@@ -369,6 +351,7 @@ const MODAL_MATCH_SELECTORS = [
   'dialog',
   '[role="dialog"]',
   '[role="alertdialog"]',
+  '[aria-modal="true"]',
   '.modal',
   '.popup',
   '.overlay',
@@ -395,6 +378,21 @@ const MODAL_MATCH_SELECTORS = [
   'ytm-purchase-dialog-renderer',
   'ytd-purchase-dialog-renderer',
   '.ytp-modal',
+  // App-specific Vue modals
+  '[id*="prevent-closing"]',
+  '[id*="confirm_modal"]',
+  '[id="modal-1"]',
+  '[id*="datetimemodal"]',
+  '[id*="recipientsModal"]',
+  '[id*="showModal"]',
+  '[id*="repTreeModal"]',
+  '[id*="smsAccountModal"]',
+  '[id*="validationOtpModal"]',
+  '[id*="modal"]',
+  '[ref*="modal"]',
+  // Payment/checkout widget shells seen in the wild
+  '#buyFlowDivId',
+  '.b3-modal-dialog',
 ] as const;
 
 const MODAL_MATCH_COMBINED = MODAL_MATCH_SELECTORS.join(', ');
@@ -425,8 +423,9 @@ function createModalBadge(modal: HTMLElement, label: string, href?: string): HTM
   btn.style.cursor = 'pointer';
   btn.style.fontSize = '12px';
 
-  btn.addEventListener('click', async (e) => {
+  btn.addEventListener('click', (e) => {
     e.preventDefault();
+    void (async () => {
     try {
       if (label === 'Copy payment data') {
         try { await handleCopyPaymentForModal(modal, href); } catch (err) { console.debug('[FDF Pro] copy payment data failed', err); }
@@ -444,9 +443,9 @@ function createModalBadge(modal: HTMLElement, label: string, href?: string): HTM
           }
 
           if (fa.fields.length > 0) {
-            const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
-            if (genResp && (genResp as any).success && (genResp as any).data) {
-              const enriched = (genResp as any).data as FormAnalysis;
+            const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } });
+            if (genResp && genResp.success && genResp.data) {
+              const enriched = genResp.data;
               hotkeyFillInProgress = true;
               try { await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } }); } finally { hotkeyFillInProgress = false; }
             }
@@ -460,14 +459,15 @@ function createModalBadge(modal: HTMLElement, label: string, href?: string): HTM
       if (href && !href.startsWith('#')) {
         window.open(href, '_blank');
       } else {
-        try { (modal as HTMLElement).focus?.(); } catch {}
+        try { (modal).focus?.(); } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
     } catch { /* ignore */ }
+    })();
   });
 
   document.body.appendChild(btn);
   // Schedule auto-remove so badges don't linger indefinitely
-  try { scheduleBadgeAutoRemove(btn); } catch {}
+  try { scheduleBadgeAutoRemove(btn); } catch (e) { logSwallowed('src/content/index.ts', e); }
   return btn;
 }
 
@@ -479,16 +479,20 @@ function createCopyBadges(modal: HTMLElement, href?: string | undefined): void {
 
     // JSON format
     const jsonBtn = createModalBadge(modal, 'Copy payment (JSON)', href);
-    jsonBtn.addEventListener('click', async (e) => {
+    jsonBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      try { await handleCopyPaymentForModalWithFormat(modal, href, 'json'); } catch (err) { console.debug('[FDF Pro] copy json failed', err); }
+      void (async () => {
+        try { await handleCopyPaymentForModalWithFormat(modal, href, 'json'); } catch (err) { console.debug('[FDF Pro] copy json failed', err); }
+      })();
     });
 
     // Single-line format
     const singleBtn = createModalBadge(modal, 'Copy payment (single)', href);
-    singleBtn.addEventListener('click', async (e) => {
+    singleBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      try { await handleCopyPaymentForModalWithFormat(modal, href, 'single'); } catch (err) { console.debug('[FDF Pro] copy single failed', err); }
+      void (async () => {
+        try { await handleCopyPaymentForModalWithFormat(modal, href, 'single'); } catch (err) { console.debug('[FDF Pro] copy single failed', err); }
+      })();
     });
   } catch { /* ignore */ }
 }
@@ -499,9 +503,9 @@ function createCopyBadges(modal: HTMLElement, href?: string | undefined): void {
 function removeAllModalBadges(): void {
   try {
     for (const el of Array.from(document.querySelectorAll('button[data-fdf-badge]'))) {
-      try { el.remove(); } catch {}
+      try { el.remove(); } catch (e) { logSwallowed('src/content/index.ts', e); }
     }
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 // Schedule auto-remove for a badge element. Keeps a WeakMap of timers
@@ -515,7 +519,7 @@ function scheduleBadgeAutoRemove(btn: HTMLElement, ms = 8000): void {
     if (prev) clearTimeout(prev);
 
     const t = setTimeout(() => {
-      try { btn.remove(); } catch {}
+      try { btn.remove(); } catch (e) { logSwallowed('src/content/index.ts', e); }
       badgeAutoRemoveTimers.delete(btn);
     }, ms);
     badgeAutoRemoveTimers.set(btn, t);
@@ -529,14 +533,14 @@ function scheduleBadgeAutoRemove(btn: HTMLElement, ms = 8000): void {
     };
     const onLeave = () => {
       if (!badgeAutoRemoveTimers.has(btn)) {
-        const t2 = setTimeout(() => { try { btn.remove(); } catch {} badgeAutoRemoveTimers.delete(btn); }, ms);
+        const t2 = setTimeout(() => { try { btn.remove(); } catch (e) { logSwallowed('src/content/index.ts', e); } badgeAutoRemoveTimers.delete(btn); }, ms);
         badgeAutoRemoveTimers.set(btn, t2);
       }
     };
 
     btn.addEventListener('mouseenter', onEnter);
     btn.addEventListener('mouseleave', onLeave);
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 // Small helpers: toast + storage for last generated payment data
@@ -562,18 +566,18 @@ function showTransientToast(message: string, ms = 2200): void {
     el.textContent = message;
     el.style.opacity = '1';
     setTimeout(() => {
-      try { el!.style.transition = 'opacity 400ms'; el!.style.opacity = '0'; setTimeout(() => { try { el!.remove(); } catch {} }, 500); } catch {}
+      try { el.style.transition = 'opacity 400ms'; el.style.opacity = '0'; setTimeout(() => { try { el.remove(); } catch (e) { logSwallowed('src/content/index.ts', e); } }, 500); } catch (e) { logSwallowed('src/content/index.ts', e); }
     }, ms);
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 async function saveLastGeneratedPayment(generated: FormAnalysis, src?: string | undefined): Promise<void> {
   try {
     const payload = { ts: Date.now(), generated, src };
     if (chrome?.storage?.local && typeof chrome.storage.local.set === 'function') {
-      await chrome.storage.local.set({ fdf_last_generated_payment: payload } as any);
+      await chrome.storage.local.set({ fdf_last_generated_payment: payload });
     }
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 async function getLastGeneratedPayment(): Promise<{ ts: number; generated: FormAnalysis; src?: string } | null> {
@@ -581,15 +585,15 @@ async function getLastGeneratedPayment(): Promise<{ ts: number; generated: FormA
     if (chrome?.storage?.local && typeof chrome.storage.local.get === 'function') {
       return await new Promise((resolve) => {
         try {
-          chrome.storage.local.get('fdf_last_generated_payment', (v: any) => {
-            try { resolve(v?.fdf_last_generated_payment ?? null); } catch { resolve(null); }
+          chrome.storage.local.get('fdf_last_generated_payment', (v: Record<string, unknown>) => {
+            try { resolve((v.fdf_last_generated_payment as { ts: number; generated: FormAnalysis; src?: string } | undefined) ?? null); } catch { resolve(null); }
           });
         } catch {
           resolve(null);
         }
       });
     }
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
   return null;
 }
 
@@ -600,7 +604,7 @@ function getOpenModalsIncludingPaymentIframes(): HTMLElement[] {
     // Only include iframe parents that themselves match a modal selector –
     // a bare <div> wrapping an ad/analytics iframe should NOT block fills.
     const extras = Array.from(document.querySelectorAll<HTMLElement>('iframe'))
-      .map((f) => f.closest(MODAL_MATCH_COMBINED) as HTMLElement | null)
+      .map((f) => f.closest(MODAL_MATCH_COMBINED))
       .filter((x): x is HTMLElement => !!x);
     const all = [...candidates, ...extras];
     const uniq = new Set<HTMLElement>();
@@ -609,19 +613,20 @@ function getOpenModalsIncludingPaymentIframes(): HTMLElement[] {
       if (uniq.has(el)) return false;
       uniq.add(el);
       try {
-        if ((el as HTMLElement).offsetParent === null) return false;
+        if ((el).offsetParent === null) return false;
         const style = window.getComputedStyle(el);
         if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
 
         // For generic class-based matches (.modal, .popup etc), require they actually
         // look like an overlay (fixed/absolute and high z-index) or are <dialog>.
         const tag = el.tagName.toLowerCase();
-        if (tag !== 'dialog' && el.getAttribute('role') !== 'dialog' && el.getAttribute('role') !== 'alertdialog') {
+        const isCustomModalId = /prevent-closing|modal-1|confirm_modal|datetimemodal|recipientsModal|showModal|repTreeModal|smsAccountModal|validationOtpModal|buyFlowDivId/i.test(el.id || el.getAttribute('ref') || '');
+        if (tag !== 'dialog' && el.getAttribute('role') !== 'dialog' && el.getAttribute('role') !== 'alertdialog' && !isCustomModalId) {
           const isOverlay = style.position === 'fixed' || style.position === 'absolute';
           const zIndex = parseInt(style.zIndex, 10);
           if (!isOverlay || isNaN(zIndex) || zIndex < 10) return false;
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/index.ts', e); }
       return true;
     });
   } catch { return []; }
@@ -643,11 +648,11 @@ async function copyTextToClipboard(text: string): Promise<void> {
     ta.select();
     try {
       document.execCommand('copy');
-    } catch {}
-    try { ta.remove(); } catch {}
+    } catch (e) { logSwallowed('src/content/index.ts', e); }
+    try { ta.remove(); } catch (e) { logSwallowed('src/content/index.ts', e); }
     return;
   } catch (e) {
-    try { console.debug('[FDF Pro] copyTextToClipboard failed', e); } catch {}
+    try { console.debug('[FDF Pro] copyTextToClipboard failed', e); } catch (e) { logSwallowed('src/content/index.ts', e); }
   }
 }
 
@@ -670,8 +675,8 @@ async function handleCopyPaymentForModalWithFormat(modal: HTMLElement, iframeSrc
           if (formEl) {
             const fa = buildFormAnalysisFromIframe(formEl, doc, iframe);
             const resp = await sendMessageSafe({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } }) as ExtensionResponse | { success: false; error: string };
-            if (resp && (resp as any).success && (resp as any).data) {
-              generated = (resp as any).data as FormAnalysis;
+            if (resp && resp.success && resp.data) {
+              generated = resp.data as FormAnalysis;
             }
           }
         }
@@ -693,7 +698,7 @@ async function handleCopyPaymentForModalWithFormat(modal: HTMLElement, iframeSrc
         action: '', method: 'POST', hasSubmitButton: false, isMultiStep: false, currentStep: 1, totalSteps: 1, analyzedAt: new Date().toISOString(),
       };
       const genResp = await sendMessageSafe({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: synthetic } }) as ExtensionResponse | { success: false; error: string };
-      if (genResp && (genResp as any).success && (genResp as any).data) generated = (genResp as any).data as FormAnalysis;
+      if (genResp && genResp.success && genResp.data) generated = genResp.data as FormAnalysis;
     }
 
     if (!generated) return;
@@ -711,13 +716,36 @@ async function handleCopyPaymentForModalWithFormat(modal: HTMLElement, iframeSrc
 
     await copyTextToClipboard(payloadText);
     showTransientToast('Payment data copied to clipboard');
-    try { await saveLastGeneratedPayment(generated, iframeSrc ?? undefined); } catch {}
+    try { await saveLastGeneratedPayment(generated, iframeSrc ?? undefined); } catch (e) { logSwallowed('src/content/index.ts', e); }
     console.info('[FDF Pro] copied generated payment data to clipboard (format=' + format + ')');
   } catch (err) {
-    try { console.debug('[FDF Pro] handleCopyPaymentForModal error', err); } catch {}
+    try { console.debug('[FDF Pro] handleCopyPaymentForModal error', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
   }
 }
 
+
+function shouldSkipAutoFillModal(modal: HTMLElement): boolean {
+  const identifier = `${modal.id || ''} ${modal.className || ''} ${modal.getAttribute('ref') || ''}`.toLowerCase();
+  
+  // Skip confirmation, OTP, verification, date/time pickers
+  const skipKeywords = [
+    'delete', 'confirm', 'remove', 'destroy', 'cancel',
+    'otp', 'verify', 'verification', 'code', 'security',
+    'date', 'time', 'picker', 'calendar', 'clock'
+  ];
+  
+  if (skipKeywords.some(kw => identifier.includes(kw))) {
+    return true;
+  }
+  
+  // Also check modal title for the same keywords
+  const titleText = (modal.querySelector('[class*="title"], h1, h2, h3')?.textContent || '').toLowerCase();
+  if (skipKeywords.some(kw => titleText.includes(kw))) {
+    return true;
+  }
+  
+  return false;
+}
 
 /**
  * Detect visible modal forms and fill them automatically.
@@ -732,23 +760,20 @@ async function checkAndFillModals(): Promise<void> {
     // All modals are now closed — allow the next open to be filled again.
     modalFilledHistory.clear();
     // Remove any injected UI for modals
-    try { removeAllModalBadges(); } catch {}
+    try { removeAllModalBadges(); } catch (e) { logSwallowed('src/content/index.ts', e); }
     return;
   }
 
   // Refresh the setting from storage (cheap; only done when a modal-related mutation fires)
   try {
     const resp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GET_SETTINGS' }) as ExtensionResponse | { success: false; error: string };
-    if (resp && (resp as any).success && (resp as any).data) {
-      autoFillModals = ((resp as any).data as { autoFillModals?: boolean }).autoFillModals ?? true;
+    if (resp && resp.success && resp.data) {
+      autoFillModals = (resp.data as { autoFillModals?: boolean }).autoFillModals ?? true;
     }
   } catch { /* keep cached value */ }
 
   if (!autoFillModals) return;
 
-  // NOTE: By design we do NOT auto-fill every detected modal. Auto-filling
-  // forms rendered inside modal overlays can target the wrong inputs.
-  // We ONLY inject helpful badges. The user must click 'Fill now' to fill.
   try {
     for (const modal of openModals) {
       try {
@@ -766,14 +791,63 @@ async function checkAndFillModals(): Promise<void> {
           continue;
         }
 
-        // Inject badges for all detected modals. Auto-fill is DISABLED to ensure consent.
+        // Inject badges for all detected modals.
         const src = (modal.id ? `#${modal.id}` : undefined);
         createModalBadge(modal, 'Fill now', src);
         createCopyBadges(modal, src);
 
-      } catch {}
+        // Generate a fingerprint for the modal inputs
+        const inputs = Array.from(modal.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input:not([type="hidden"]), textarea, select'));
+        const modalFingerprint = modal.id ? `#${modal.id}` : formFingerprint(inputs.map((el, idx) => ({
+          id: el.id || `m-fld-${idx}`,
+          index: idx,
+          type: 'text',
+          htmlType: el.tagName.toLowerCase(),
+          name: el.name || '',
+          label: '',
+          placeholder: '',
+          constraints: { minLength: null, maxLength: null, min: null, max: null, pattern: null, step: null, required: false, readOnly: false, disabled: false, multiple: false, accept: null },
+          required: false,
+          selector: '',
+          formIndex: 0,
+          confidence: 0.5,
+        })));
+
+        // Automatically fill modal form if not filled yet and not skipped
+        if (!modalFilledHistory.has(modalFingerprint) && !shouldSkipAutoFillModal(modal)) {
+          modalFilledHistory.add(modalFingerprint);
+
+          const modalFormEl = modal.querySelector('form') as HTMLElement | null;
+          let fa: FormAnalysis;
+          if (modalFormEl) {
+            fa = detector.analyzeForm(modalFormEl);
+          } else {
+            fa = buildFormAnalysisFromContainer(modal);
+          }
+
+          if (fa.fields.length > 0) {
+            modalFillPending = true;
+            try {
+              const genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: fa } });
+              if (genResp && genResp.success && genResp.data) {
+                const enriched = genResp.data;
+                hotkeyFillInProgress = true;
+                try {
+                  await dispatch({ action: 'FILL_FORM', payload: { formAnalysis: enriched } });
+                } finally {
+                  hotkeyFillInProgress = false;
+                }
+              }
+            } catch (err) {
+              console.debug('[FDF Pro] modal auto-fill failed', err);
+            } finally {
+              modalFillPending = false;
+            }
+          }
+        }
+      } catch (e) { logSwallowed('src/content/index.ts', e); }
     }
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 /** Build a simple FormAnalysis for a form root inside a same-origin iframe document. */
@@ -793,7 +867,7 @@ function buildFormAnalysisFromIframe(formEl: HTMLElement, iframeDoc: Document, _
         if (byFor) return (byFor.textContent || '').trim();
         const parentLabel = el.closest('label');
         if (parentLabel) return (parentLabel.textContent || '').trim();
-      } catch {}
+      } catch (e) { logSwallowed('src/content/index.ts', e); }
       return '';
     })();
 
@@ -840,77 +914,14 @@ function buildFormAnalysisFromIframe(formEl: HTMLElement, iframeDoc: Document, _
   } as FormAnalysis;
 }
 
-/** Build a FormAnalysis from loose inputs inside a container (no <form> tag needed). */
+/**
+ * Build a FormAnalysis from loose inputs inside a container (no <form> tag needed).
+ * Delegates to the shared FormDetectionEngine so modal/ad-hoc containers get the
+ * same HTML5 → autocomplete → regex → heuristic classification as regular forms,
+ * instead of a raw (and type-unsafe) `input.type` passthrough.
+ */
 function buildFormAnalysisFromContainer(container: HTMLElement): FormAnalysis {
-  const inputEls = Array.from(
-    container.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
-      'input:not([type="hidden"]), textarea, select',
-    ),
-  ).slice(0, 200);
-
-  const fields = inputEls.map((el, i) => {
-    const htmlType = ((el as HTMLInputElement).type || (el.tagName || '').toLowerCase()).toLowerCase();
-    const name = el.name ?? '';
-    const id = el.id ?? '';
-    const placeholder = (el as HTMLInputElement).placeholder ?? '';
-    const label = (function findLabel(): string {
-      try {
-        const byFor = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-        if (byFor) return (byFor.textContent || '').trim();
-        const parentLabel = el.closest('label');
-        if (parentLabel) return (parentLabel.textContent || '').trim();
-        // Try aria-label
-        const aria = el.getAttribute('aria-label');
-        if (aria) return aria.trim();
-      } catch {}
-      return '';
-    })();
-
-    return {
-      id: `modal-${i}-${Date.now()}`,
-      index: i,
-      type: 'text' as const,
-      htmlType,
-      name,
-      label,
-      placeholder,
-      constraints: {
-        minLength: null,
-        maxLength: null,
-        min: null,
-        max: null,
-        pattern: null,
-        step: null,
-        required: false,
-        readOnly: false,
-        disabled: false,
-        multiple: false,
-        accept: null,
-      },
-      required: (el as HTMLInputElement).required ?? false,
-      selector: cssSelectorInDocument(el, document),
-      formIndex: 0,
-      confidence: 0.5,
-    };
-  });
-
-  const containerSelector = container.id
-    ? `#${CSS.escape(container.id)}`
-    : cssSelectorInDocument(container, document);
-
-  return {
-    index: Date.now(),
-    type: 'unknown',
-    fields,
-    selector: containerSelector,
-    action: '',
-    method: 'GET',
-    hasSubmitButton: container.querySelector('[type="submit"], button:not([type="button"])') !== null,
-    isMultiStep: false,
-    currentStep: 1,
-    totalSteps: 1,
-    analyzedAt: new Date().toISOString(),
-  } as FormAnalysis;
+  return detector.analyzeForm(container);
 }
 
 /** Generate a stable selector for an element relative to a given document. */
@@ -923,7 +934,7 @@ function cssSelectorInDocument(el: Element, doc: Document): string {
     if (td) return `[data-testid="${CSS.escape(td)}"]`;
     const aria = asEl.getAttribute('aria-label');
     if (aria) return `${asEl.tagName.toLowerCase()}[aria-label="${CSS.escape(aria)}"]`;
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 
   if ((el as HTMLElement).id) return `#${CSS.escape((el as HTMLElement).id)}`;
 
@@ -940,7 +951,8 @@ function cssSelectorInDocument(el: Element, doc: Document): string {
       path.unshift(selector);
       break;
     } else {
-      const siblings = Array.from(node.parentElement?.children ?? []).filter((s) => s.tagName === node!.tagName);
+      const currentTag = node.tagName;
+      const siblings = Array.from(node.parentElement?.children ?? []).filter((s) => s.tagName === currentTag);
       if (siblings.length > 1) {
         const idx = siblings.indexOf(node) + 1;
         selector += `:nth-of-type(${idx})`;
@@ -988,6 +1000,19 @@ function handleMessage(
 }
 
 async function dispatch(message: ExtensionMessage): Promise<unknown> {
+  // Domain blocklist gate — this is the authoritative check (the content
+  // script always sees the real page hostname, unlike the background
+  // service worker, which may lack permission to read it in every context).
+  // ANALYZE_FORMS/FILL_FORM are gated here so no fill path — toolbar click,
+  // hotkey, or chaining — can ever run on a blocklisted domain, even if the
+  // request reached the content script directly.
+  if (message.action === 'ANALYZE_FORMS' || message.action === 'FILL_FORM') {
+    if (!(await shouldActivateOnCurrentDomain())) {
+      console.info('[FDF Pro] dispatch: blocked domain, refusing', message.action);
+      return message.action === 'ANALYZE_FORMS' ? [] : { filled: 0, skipped: 0, blocked: true };
+    }
+  }
+
   switch (message.action) {
     case 'ANALYZE_FORMS': {
       cachedForms = detector.detectForms();
@@ -1006,7 +1031,23 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
         formAnalysis: FormAnalysis;
         maxRetries?: number;
       };
-      try { console.info('[FDF Pro] FILL_FORM request for selector', formAnalysis.selector, 'fields:', formAnalysis.fields.length); } catch {}
+      try { console.info('[FDF Pro] FILL_FORM request for selector', formAnalysis.selector, 'fields:', formAnalysis.fields.length); } catch (e) { logSwallowed('src/content/index.ts', e); }
+
+      // Respect skipLoginForms / skipPaymentForms — never auto-fill a form
+      // whose detected type the user has opted out of (e.g. a real checkout
+      // or login form the extension shouldn't be touching).
+      let cachedSettings: Settings | undefined;
+      try {
+        const settingsResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<Settings>>({ action: 'GET_SETTINGS' });
+        cachedSettings = settingsResp?.success ? settingsResp.data : undefined;
+        if (cachedSettings?.skipLoginForms && formAnalysis.type === 'login') {
+          return { skipped: true, reason: 'login_form_skipped' };
+        }
+        if (cachedSettings?.skipPaymentForms && (formAnalysis.type === 'payment' || formAnalysis.type === 'checkout')) {
+          return { skipped: true, reason: 'payment_form_skipped' };
+        }
+      } catch (e) { logSwallowed('src/content/index.ts:FILL_FORM:settings-check', e); }
+
       // If a modal is currently open, avoid filling forms that are not
       // contained inside that modal. This prevents auto-fill from targeting
       // inputs visible behind overlays (e.g., search box under a payments modal).
@@ -1025,19 +1066,19 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
                 const src = iframe instanceof HTMLIFrameElement ? (iframe.getAttribute('src') || iframe.src) : undefined;
                 createModalBadge(m, 'Open payment', src);
                 createCopyBadges(m, src);
-              } catch {}
-              try { console.info('[FDF Pro] Skipping fill because a modal overlay is open and target form is outside it'); } catch {}
+              } catch (e) { logSwallowed('src/content/index.ts', e); }
+              try { console.info('[FDF Pro] Skipping fill because a modal overlay is open and target form is outside it'); } catch (e) { logSwallowed('src/content/index.ts', e); }
               return { skipped: true, reason: 'modal_overlay_present' };
             }
-          } catch {}
+          } catch (e) { logSwallowed('src/content/index.ts', e); }
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/index.ts', e); }
       isFilling = true;
       const result = await filler.fillFormWithRecovery(formAnalysis, {
         maxRetries: maxRetries ?? 3,
       });
 
-      try { console.info('[FDF Pro] FILL_FORM result for selector', formAnalysis.selector, result); } catch {}
+      try { console.info('[FDF Pro] FILL_FORM result for selector', formAnalysis.selector, result); } catch (e) { logSwallowed('src/content/index.ts', e); }
 
       // Keep the mutation observer for server-side / post-submit errors.
       // During chaining, skip the error observer — it causes recovery loops
@@ -1048,11 +1089,10 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
       // ALSO: Only start if explicitly enabled in settings to avoid unwanted auto-fills.
       if (!chainingActive) {
         try {
-          const s = await sendMessageSafe({ action: 'GET_SETTINGS' });
-          if (s && s.success && s.data?.errorRecoveryEnabled) {
-            startErrorObserver(formAnalysis.fields);
+          if (cachedSettings?.errorRecoveryEnabled) {
+            startErrorObserver(formAnalysis.fields, formAnalysis.selector);
           }
-        } catch {}
+        } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
 
       // Send a short confirmation payload back to the background so
@@ -1076,7 +1116,7 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
 
         void sendMessageSafe({ action: 'REPORT_FILLED', payload: { filled: filledSamples } });
       } catch (e) {
-        try { console.debug('[FDF Pro] failed to send REPORT_FILLED', e); } catch {}
+        try { console.debug('[FDF Pro] failed to send REPORT_FILLED', e); } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
 
       // Track fingerprint so chaining won't re-fill the same form.
@@ -1110,11 +1150,13 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
         lastFilledFingerprint = fp;
         filledFingerprintHistory.add(fp);
       }
-      // Load delay setting
+      // Load delay setting (reserved for future content-side use; background
+      // controls the actual inter-step delay).
       try {
         const resp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({ action: 'GET_SETTINGS' }) as ExtensionResponse | { success: false; error: string };
-        if (resp && (resp as any).success && (resp as any).data) {
-          chainingDelayMs = Math.max(500, ((resp as any).data as { chainingDelayMs?: number }).chainingDelayMs ?? 500);
+        if (resp && resp.success && resp.data) {
+          // chainingDelayMs stored in settings; background reads it directly.
+          void (resp.data as { chainingDelayMs?: number }).chainingDelayMs;
         }
       } catch { /* use default */ }
       console.debug('[FDF Pro] chaining enabled on content script');
@@ -1198,7 +1240,10 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
 // Error element collection (sent to background for analysis)
 // -----------------------------------------------------------
 
-function collectErrorElements(fields?: FieldAnalysis[]): Array<{
+function collectErrorElements(
+  fields?: FieldAnalysis[],
+  scopeEl?: ParentNode,
+): Array<{
   selector: string;
   text: string;
   nearFieldName?: string;
@@ -1206,10 +1251,11 @@ function collectErrorElements(fields?: FieldAnalysis[]): Array<{
 }> {
   const seen = new Set<Element>();
   const results: Array<{ selector: string; text: string; nearFieldName?: string; nearFieldId?: string }> = [];
+  const scope = scopeEl ?? document;
 
   for (const sel of ERROR_SELECTORS) {
     try {
-      document.querySelectorAll(sel).forEach((el) => {
+      scope.querySelectorAll(sel).forEach((el) => {
         if (seen.has(el)) return;
         seen.add(el);
 
@@ -1369,7 +1415,7 @@ function collectErrorElements(fields?: FieldAnalysis[]): Array<{
                   || inputEl.getAttribute('aria-invalid') === 'true';
                 if (inputEl.value && typeof inputEl.validity !== 'undefined' && inputEl.validity.valid && !hasServerErrCls) return;
               }
-            } catch {}
+            } catch (e) { logSwallowed('src/content/index.ts', e); }
           }
         }
 
@@ -1394,7 +1440,7 @@ function collectErrorElements(fields?: FieldAnalysis[]): Array<{
     for (const field of fields) {
       if (fieldsWithErrors.has(field.id)) continue;
       try {
-        const el = document.querySelector(field.selector) as HTMLElement | null;
+        const el = document.querySelector(field.selector);
         if (!el) continue;
         const input = el as HTMLInputElement;
 
@@ -1423,7 +1469,7 @@ function collectErrorElements(fields?: FieldAnalysis[]): Array<{
             try {
               const errMsgEl = document.getElementById(errMsgId);
               if (errMsgEl) errorText = errMsgEl.textContent?.trim() ?? '';
-            } catch {}
+            } catch (e) { logSwallowed('src/content/index.ts', e); }
           }
         }
         if (!errorText) {
@@ -1460,7 +1506,7 @@ function collectErrorElements(fields?: FieldAnalysis[]): Array<{
             nearFieldId: field.id,
           });
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/index.ts', e); }
     }
   }
 
@@ -1477,7 +1523,7 @@ function isErrorElementActive(el: Element): boolean {
       const cs = window.getComputedStyle(htmlEl);
       if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
     }
-  } catch {}
+  } catch (e) { logSwallowed('src/content/index.ts', e); }
 
   const container = el.closest(
     '.form-group, .form-field, .field-group, .input-group, .field-wrapper, .form-row',
@@ -1496,7 +1542,7 @@ function isErrorElementActive(el: Element): boolean {
     // not on the container.
     const nearestInput = container.querySelector(
       'input, textarea, select',
-    ) as HTMLElement | null;
+    );
     if (nearestInput) {
       if (
         nearestInput.classList?.contains('is-invalid') ||
@@ -1539,7 +1585,7 @@ const observerSeenErrors = new Set<string>();
 let activeErrorObserver: MutationObserver | null = null;
 let activeErrorObserverTimeout: ReturnType<typeof setTimeout> | null = null;
 
-function startErrorObserver(fields: FieldAnalysis[]): void {
+function startErrorObserver(fields: FieldAnalysis[], formSelector?: string): void {
   // Disconnect any previous error observer to prevent accumulation
   if (activeErrorObserver) {
     try { activeErrorObserver.disconnect(); } catch { /* ignore */ }
@@ -1560,7 +1606,7 @@ function startErrorObserver(fields: FieldAnalysis[]): void {
 
     if (errorObserverTimer) clearTimeout(errorObserverTimer);
     errorObserverTimer = setTimeout(() => {
-      void notifyBackgroundOfErrors(fields);
+      void notifyBackgroundOfErrors(fields, formSelector);
     }, LIMITS.ERROR_OBSERVER_DEBOUNCE_MS);
   });
 
@@ -1584,10 +1630,10 @@ function startErrorObserver(fields: FieldAnalysis[]): void {
   }, 120_000);
 }
 
-async function notifyBackgroundOfErrors(fields: FieldAnalysis[]): Promise<void> {
+async function notifyBackgroundOfErrors(fields: FieldAnalysis[], formSelector?: string): Promise<void> {
   // Respect user consent for automatic error recovery.
   try {
-    const s = await sendMessageSafe({ action: 'GET_SETTINGS' });
+    const s = await sendMessageSafe<ExtensionMessage, ExtensionResponse<Settings>>({ action: 'GET_SETTINGS' });
     if (!s || !s.success || !s.data || !s.data.errorRecoveryEnabled) {
       if (activeErrorObserver) {
         activeErrorObserver.disconnect();
@@ -1597,7 +1643,15 @@ async function notifyBackgroundOfErrors(fields: FieldAnalysis[]): Promise<void> 
     }
   } catch { return; }
 
-  const allErrors = collectErrorElements(fields);
+  // Scope the error scan to the form container when we know its selector —
+  // scanning the whole document on every debounced mutation is needless
+  // work once we already know which form we're recovering.
+  const scopeEl = (() => {
+    if (!formSelector) return undefined;
+    try { return document.querySelector(formSelector) ?? undefined; } catch { return undefined; }
+  })();
+
+  const allErrors = collectErrorElements(fields, scopeEl);
   // Only send field-associated errors to avoid page-level noise
   const errorElements = allErrors.filter((e) => (e.nearFieldName && e.nearFieldName.length > 0) || (e.nearFieldId && e.nearFieldId.length > 0));
   if (errorElements.length === 0) return;
@@ -1613,13 +1667,13 @@ async function notifyBackgroundOfErrors(fields: FieldAnalysis[]): Promise<void> 
 
   observerRecoveryCount++;
 
-  const response = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({
+  const response = await sendMessageSafe<ExtensionMessage, ExtensionResponse<DetectErrorsResult>>({
     action: 'DETECT_ERRORS',
     payload: { errorElements: newErrors, fields },
-  }) as ExtensionResponse | { success: false; error: string };
+  });
 
-  if (response && (response as any).success && (response as any).data) {
-    const { recovery } = (response as any).data as { recovery: { updatedFields: Array<{ field: string; value: string }> } | null };
+  if (response && response.success && response.data) {
+    const { recovery } = response.data;
     if (recovery?.updatedFields) {
       // Save current active element to restore after recovery fills
       const previousActive = document.activeElement as HTMLElement | null;
@@ -1634,7 +1688,7 @@ async function notifyBackgroundOfErrors(fields: FieldAnalysis[]): Promise<void> 
           try {
             const cs = typeof getComputedStyle === 'function' ? getComputedStyle(el) : null;
             if (cs && cs.display === 'none') continue;
-            if (el.offsetParent === null && (el as HTMLElement).style?.position !== 'fixed') continue;
+            if (el.offsetParent === null && (el).style?.position !== 'fixed') continue;
           } catch { /* ignore */ }
 
           // Skip if the field already has a valid value (don't overwrite good data)
@@ -1696,7 +1750,7 @@ function autoSubmitForm(): { clicked: boolean; selector: string | null } {
   for (const sel of selectors) {
     const btn = document.querySelector<HTMLElement>(sel);
     if (btn && btn.offsetParent !== null) {
-      try { console.info('[FDF Pro] auto-submit clicking:', sel); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.info('[FDF Pro] auto-submit clicking:', sel); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/index.ts', e); } }
       btn.click();
       return { clicked: true, selector: sel };
     }
@@ -1710,13 +1764,13 @@ function autoSubmitForm(): { clicked: boolean; selector: string | null } {
   for (const btn of allButtons) {
     const text = btn.textContent?.trim() ?? '';
     if (textPatterns.test(text)) {
-      try { console.info('[FDF Pro] auto-submit clicking by text:', text); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.info('[FDF Pro] auto-submit clicking by text:', text); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/index.ts', e); } }
       btn.click();
       return { clicked: true, selector: text };
     }
   }
 
-  try { console.info('[FDF Pro] auto-submit: no submit/next button found'); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+  try { console.info('[FDF Pro] auto-submit: no submit/next button found'); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/index.ts', e); } }
   return { clicked: false, selector: null };
 }
 
@@ -1725,15 +1779,17 @@ function autoSubmitForm(): { clicked: boolean; selector: string | null } {
 // -----------------------------------------------------------
 
 async function shouldActivateOnCurrentDomain(): Promise<boolean> {
-  const settingsResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse>({
+  const settingsResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<Settings>>({
     action: 'GET_SETTINGS',
-  }) as ExtensionResponse | { success: false; error: string };
-  if (!settingsResp || !(settingsResp as any).success || !(settingsResp as any).data) return true;
+  });
+  if (!settingsResp || !settingsResp.success || !settingsResp.data) {
+    // Fail closed: if we can't confirm the domain isn't blocklisted (e.g. the
+    // service worker is asleep and GET_SETTINGS timed out), don't activate
+    // rather than risk running on a blocklisted banking/payment domain.
+    return false;
+  }
 
-  const settings = (settingsResp as any).data as {
-    domainBlacklist: string[];
-    domainWhitelist: string[];
-  };
+  const settings = settingsResp.data;
   const hostname = location.hostname;
 
   if (matchesHostnameList(hostname, settings.domainBlacklist)) return false;
@@ -1754,9 +1810,11 @@ async function shouldActivateOnCurrentDomain(): Promise<boolean> {
 void (async () => {
   if (!(await shouldActivateOnCurrentDomain())) return;
 
-  // Install the API response interceptor early so it captures all
-  // XHR/fetch error responses from form submissions.
-  try { installApiInterceptor(); } catch { /* ignore */ }
+  // Note: the API response interceptor itself is installed by a separate
+  // MAIN-world content script (api-interceptor-main.ts, see manifest.json) —
+  // installing it here would patch this isolated world's own fetch/XHR
+  // globals, which the page never calls. This script listens for the
+  // API_ERROR_EVENT bridge below instead.
 
   // Initial form detection after page load
   await new Promise<void>((resolve) => {
@@ -1864,7 +1922,9 @@ void (async () => {
   // background, and re-fill the failing fields.
   // ----------------------------------------------------------
   let apiRecoveryInProgress = false;
-  onApiError(async (entry: ApiErrorEntry) => {
+  window.addEventListener(API_ERROR_EVENT, (evt) => {
+    const entry = (evt as CustomEvent<ApiErrorEntry>).detail;
+    void (async () => {
     if (apiRecoveryInProgress || isFilling) return;
     if (entry.fieldErrors.length === 0) return;
 
@@ -1893,7 +1953,7 @@ void (async () => {
     }
 
     if (apiToField.size === 0) {
-      try { console.debug('[FDF Pro] API errors captured but no field matches:', entry.fieldErrors.map(e => e.field)); } catch {}
+      try { console.debug('[FDF Pro] API errors captured but no field matches:', entry.fieldErrors.map(e => e.field)); } catch (e) { logSwallowed('src/content/index.ts', e); }
       return;
     }
 
@@ -1903,24 +1963,28 @@ void (async () => {
 
       // Build error elements from API errors for the background recovery engine
       const errorElements = entry.fieldErrors
-        .filter((e) => apiToField.has(e.field))
-        .map((e) => ({
-          selector: apiToField.get(e.field)!.selector,
-          text: e.messages.join('; '),
-          nearFieldName: apiToField.get(e.field)!.name || apiToField.get(e.field)!.label,
-          nearFieldId: apiToField.get(e.field)!.id,
-        }));
+        .map((e) => {
+          const field = apiToField.get(e.field);
+          if (!field) return null;
+          return {
+            selector: field.selector,
+            text: e.messages.join('; '),
+            nearFieldName: field.name || field.label,
+            nearFieldId: field.id,
+          };
+        })
+        .filter((e): e is NonNullable<typeof e> => e !== null);
 
-      const resp = await sendMessageSafe({
+      const resp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<DetectErrorsResult>>({
         action: 'DETECT_ERRORS',
         payload: {
           errorElements,
           fields: allFields,
         },
-      }) as any;
+      });
 
       if (resp && resp.success && resp.data?.recovery?.updatedFields?.length) {
-        const updates = resp.data.recovery.updatedFields as Array<{ field: string; value: string }>;
+        const updates = resp.data.recovery.updatedFields;
         console.info('[FDF Pro] API recovery: applying', updates.length, 'field corrections');
 
         for (const { field: fieldId, value } of updates) {
@@ -1933,13 +1997,14 @@ void (async () => {
           await filler.fillField(el, { ...fieldAnalysis, value });
         }
       } else {
-        try { console.debug('[FDF Pro] API recovery: no recovery suggestions from background'); } catch {}
+        try { console.debug('[FDF Pro] API recovery: no recovery suggestions from background'); } catch (e) { logSwallowed('src/content/index.ts', e); }
       }
     } catch (err) {
-      try { console.debug('[FDF Pro] API error recovery failed', err); } catch {}
+      try { console.debug('[FDF Pro] API error recovery failed', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
     } finally {
       apiRecoveryInProgress = false;
     }
+    })();
   });
 
   // ----------------------------------------------------------
@@ -1962,7 +2027,7 @@ void (async () => {
       // page was suspended or an SPA restored UI.
       void checkAndFillModals();
     } catch (err) {
-      try { console.debug('[FDF Pro] reinitialize failed', err); } catch {}
+      try { console.debug('[FDF Pro] reinitialize failed', err); } catch (e) { logSwallowed('src/content/index.ts', e); }
     }
   }
 

@@ -10,6 +10,7 @@ import type {
 } from '@/shared/types';
 import { ERROR_PATTERNS, ERROR_SELECTORS, STORAGE_KEYS } from '@/shared/constants';
 import type { DataGenerator } from './data-generator';
+import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // ErrorRecoveryEngine
@@ -127,7 +128,9 @@ export class ErrorRecoveryEngine {
   private async recordTelemetry(payload: { attempted: number; successful: number; manual: number; timestamp: string }): Promise<void> {
     try {
       const stored = await chrome.storage.local.get(STORAGE_KEYS.TELEMETRY);
-      const current = (stored[STORAGE_KEYS.TELEMETRY]) ?? { recoveries: 0, successes: 0, manual: 0, lastRun: null };
+      const current = (stored[STORAGE_KEYS.TELEMETRY] as
+        | { recoveries: number; successes: number; manual: number; lastRun: string | null }
+        | undefined) ?? { recoveries: 0, successes: 0, manual: 0, lastRun: null };
       const updated = {
         recoveries: (current.recoveries ?? 0) + (payload.attempted ?? 0),
         successes: (current.successes ?? 0) + (payload.successful ?? 0),
@@ -135,9 +138,9 @@ export class ErrorRecoveryEngine {
         lastRun: payload.timestamp,
       };
       await chrome.storage.local.set({ [STORAGE_KEYS.TELEMETRY]: updated });
-      try { console.info('[FDF Telemetry] recovery', updated); } catch (e) { try { console.debug('[FDF Pro] telemetry info log failed', e); } catch {} }
+      try { console.info('[FDF Telemetry] recovery', updated); } catch (e) { try { console.debug('[FDF Pro] telemetry info log failed', e); } catch (e) { logSwallowed('src/background/error-recovery.ts', e); } }
     } catch (err) {
-      try { console.warn('[FDF Telemetry] failed to record', err); } catch (e) { try { console.debug('[FDF Pro] telemetry warn log failed', e); } catch {} }
+      try { console.warn('[FDF Telemetry] failed to record', err); } catch (e) { try { console.debug('[FDF Pro] telemetry warn log failed', e); } catch (e) { logSwallowed('src/background/error-recovery.ts', e); } }
     }
   }
 
@@ -441,7 +444,7 @@ export class ErrorRecoveryEngine {
       for (const c of candidates) {
         if (re.test(c)) return c;
       }
-    } catch {}
+    } catch (e) { logSwallowed('src/background/error-recovery.ts', e); }
     return candidates[0];
   }
 

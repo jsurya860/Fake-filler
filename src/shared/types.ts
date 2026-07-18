@@ -297,6 +297,12 @@ export interface RecoveryResult {
   message?: string;
 }
 
+/** Response payload shape for the DETECT_ERRORS message action. */
+export interface DetectErrorsResult {
+  errorInfo: ErrorInfo;
+  recovery: RecoveryResult | null;
+}
+
 // =============================================================
 // Extension Message Passing
 // =============================================================
@@ -338,7 +344,10 @@ export type MessageAction =
 // Debug logging messages
 export interface DebugLogEntry {
   ts: number;
-  source: 'background' | 'content' | 'popup' | string;
+  // `string & {}` keeps IDE autocomplete for the known sources while still
+  // accepting any string, without TS collapsing the union to plain `string`.
+  // eslint-disable-next-line @typescript-eslint/ban-types -- intentional autocomplete-preserving idiom
+  source: 'background' | 'content' | 'popup' | (string & {});
   level: 'debug' | 'info' | 'warn' | 'error' | 'log';
   message: string;
   args?: unknown[];

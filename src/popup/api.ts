@@ -1,4 +1,5 @@
 import type { ExtensionMessage, ExtensionResponse } from '@/shared/types';
+import { logSwallowed } from '@/shared/messaging';
 
 /**
  * Send a message to the content script running in the active tab.
@@ -12,9 +13,9 @@ export async function sendToActiveTab<T = unknown>(
   try {
     const resp = await chrome.tabs.sendMessage<ExtensionMessage, ExtensionResponse<T>>(tab.id, message);
     return resp ?? { success: false, error: 'No response from content script.' };
-  } catch (err: any) {
+  } catch (err) {
     // Typical error when content script is not present in the tab
-    const msg = String(err?.message || err || '');
+    const msg = err instanceof Error ? err.message : String(err);
     if (/receiving end does not exist|could not establish connection/i.test(msg)) {
       try {
         // Try to inject the content script bundle and retry once. Try the
@@ -29,7 +30,7 @@ export async function sendToActiveTab<T = unknown>(
               injected = true;
               break;
             } catch (e) {
-              // try next
+              logSwallowed(`src/popup/api.ts: inject ${f} failed, trying next`, e);
             }
           }
           if (!injected) return { success: false, error: 'injection_failed: no injectable file found' } as ExtensionResponse<T>;

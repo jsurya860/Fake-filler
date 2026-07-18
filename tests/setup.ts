@@ -118,4 +118,20 @@ if (!(global as any).CSS) {
   };
 }
 
+// =============================================================
+// FormFiller test configuration
+// =============================================================
+// Set interFieldDelayMs to 0 globally so tests run at full speed.
+// This runs in setupFiles context (before Jest framework globals are available),
+// so we patch the prototype directly.
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { FormFiller } = require('../src/content/form-filler');
+  if (FormFiller && FormFiller.prototype) {
+    FormFiller.prototype.interFieldDelayMs = 0;
+  }
+} catch {
+  // Not available in all test suites — safe to ignore
+}
+
 export {};

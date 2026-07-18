@@ -3,7 +3,7 @@
   "name": "Fake Data Filler Pro",
   "short_name": "FDF Pro",
   "version": "1.0.0",
-  "description": "Intelligently fills forms with realistic fake data. Context-aware field detection, auto error recovery, and encrypted profiles.",
+  "description": "Intelligently fills forms with realistic fake data. Context-aware field detection, auto error recovery, local profiles.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [],
   "background": {
@@ -15,6 +15,12 @@
       "matches": ["<all_urls>"],
       "js": ["src/content/index.ts"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/api-interceptor-main.ts"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {
@@ -43,5 +49,5 @@
       "description": "Fill forms with fake data"
     }
   },
-  "minimum_chrome_version": "102"
+  "minimum_chrome_version": "111"
 }

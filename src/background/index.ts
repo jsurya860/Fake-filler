@@ -1,6 +1,8 @@
 import { MessageHandler } from './message-handler';
 import { DEFAULT_SETTINGS, STORAGE_KEYS } from '@/shared/constants';
-import type { ExtensionMessage, ExtensionResponse, FormAnalysis, Settings } from '@/shared/types';
+import type { ExtensionMessage, ExtensionResponse, FormAnalysis, RadioDiagnostic, Settings } from '@/shared/types';
+import { logSwallowed } from '@/shared/messaging';
+import { matchesHostnameList } from '@/shared/utils';
 
 // =============================================================
 // Background Service Worker Entry Point
@@ -33,8 +35,11 @@ interface ChainLogEntry {
 const chainLogs = new Map<number, ChainLogEntry[]>();
 
 function addChainLog(tabId: number, url: string, fieldsCount: number): void {
-  if (!chainLogs.has(tabId)) chainLogs.set(tabId, []);
-  const log = chainLogs.get(tabId)!;
+  let log = chainLogs.get(tabId);
+  if (!log) {
+    log = [];
+    chainLogs.set(tabId, log);
+  }
   const entry = chainingTabs.get(tabId);
   log.push({ step: entry?.fillCount ?? log.length + 1, url, fieldsCount, ts: Date.now() });
   // Keep only last 50 entries
@@ -43,7 +48,7 @@ function addChainLog(tabId: number, url: string, fieldsCount: number): void {
 
 // Store the last radio diagnostic per tab for popup/debugging
 interface RadioDiagnosticStoreEntry {
-  diag: any;
+  diag: RadioDiagnostic | null;
   ts: number;
 }
 const radioDiagnostics = new Map<number, RadioDiagnosticStoreEntry | null>();
@@ -61,10 +66,12 @@ function pushDebugLog(entry: DebugLogEntry) {
 (() => {
   try {
     const origConsole: Record<DebugLogEntry['level'], (...a: unknown[]) => void> = {
+      // eslint-disable-next-line no-console -- capturing the native method reference, not calling it
       log: console.log.bind(console),
       info: console.info.bind(console),
       warn: console.warn.bind(console),
       error: console.error.bind(console),
+      // eslint-disable-next-line no-console -- fallback to native console.log if console.debug is unavailable
       debug: (console.debug ?? console.log).bind(console),
     };
 
@@ -98,8 +105,8 @@ function enableChaining(tabId: number, _settings?: Settings): void {
   // as null for compatibility with existing cleanup code.
   chainingTabs.set(tabId, { startedAt: Date.now(), fillCount: 0, timeoutId: null });
 
-  chrome.action.setBadgeText({ tabId, text: '\u26D3' });
-  chrome.action.setBadgeBackgroundColor({ tabId, color: '#4CAF50' });
+  void chrome.action.setBadgeText({ tabId, text: '\u26D3' });
+  void chrome.action.setBadgeBackgroundColor({ tabId, color: '#4CAF50' });
   console.info('[FDF Pro] chaining enabled on tab', tabId);
 }
 
@@ -110,11 +117,9 @@ function disableChaining(tabId: number): void {
   chainingTabs.delete(tabId);
   // Keep chainLogs so popup can still review them after stopping
 
-  try {
-    chrome.action.setBadgeText({ tabId, text: '' });
-  } catch {
-    // Tab may already be closed
-  }
+  // .catch (not try/catch) — setBadgeText is promise-based; a sync try/catch
+  // here would never actually observe a rejection (e.g. tab already closed).
+  void chrome.action.setBadgeText({ tabId, text: '' }).catch((e: unknown) => logSwallowed('src/background/index.ts:disableChaining', e));
 
   // Notify the content script to stop monitoring
   try {
@@ -133,16 +138,12 @@ function incrementChainCount(tabId: number, maxSteps: number): boolean {
   if (!entry) return false;
   // If we've already reached or exceeded maxSteps, don't increment further.
   if (entry.fillCount >= maxSteps) {
-    try {
-      chrome.action.setBadgeText({ tabId, text: `\u26D3${entry.fillCount}` });
-    } catch { /* ignore */ }
+    void chrome.action.setBadgeText({ tabId, text: `\u26D3${entry.fillCount}` }).catch((e: unknown) => logSwallowed('src/background/index.ts:incrementChainCount', e));
     return true; // indicate max reached
   }
   entry.fillCount++;
   // Update badge with step count
-  try {
-    chrome.action.setBadgeText({ tabId, text: `\u26D3${entry.fillCount}` });
-  } catch { /* ignore */ }
+  void chrome.action.setBadgeText({ tabId, text: `\u26D3${entry.fillCount}` }).catch((e: unknown) => logSwallowed('src/background/index.ts:incrementChainCount', e));
   return entry.fillCount >= maxSteps;
 }
 
@@ -152,6 +153,13 @@ chrome.runtime.onMessage.addListener(
     sender: chrome.runtime.MessageSender,
     sendResponse: (response: ExtensionResponse) => void,
   ) => {
+    // Defense-in-depth: reject messages not from this extension's own
+    // content scripts/popup (see MessageHandler.handle for the same guard).
+    if (sender.id !== chrome.runtime.id) {
+      sendResponse({ success: false, error: 'Untrusted sender' });
+      return false;
+    }
+
     // PING — used by content script to wake the service worker after SW sleep.
     if (message.action === 'PING') {
       sendResponse({ success: true });
@@ -272,7 +280,7 @@ chrome.runtime.onMessage.addListener(
             sendResponse({ success: false, error: 'No active tab' });
             return;
           }
-          radioDiagnostics.set(tabId, { diag: message.payload ?? null, ts: Date.now() });
+          radioDiagnostics.set(tabId, { diag: (message.payload as RadioDiagnostic | undefined) ?? null, ts: Date.now() });
           sendResponse({ success: true });
         } catch (err) {
           sendResponse({ success: false, error: (err as Error).message });
@@ -298,48 +306,42 @@ chrome.runtime.onMessage.addListener(
 
     // Content/background log reports
     if (message.action === 'REPORT_DEBUG_LOG') {
-      void (async () => {
-        try {
-          const payload = message.payload as DebugLogEntry | DebugLogEntry[] | undefined;
-          if (!payload) {
-            sendResponse({ success: false, error: 'No payload' });
-            return;
-          }
-          const entries = Array.isArray(payload) ? payload : [payload];
-          for (const e of entries) {
-            // normalize ts
-            const entry = { ts: e.ts ?? Date.now(), source: e.source ?? 'content', level: e.level ?? 'log', message: e.message ?? String(e.args?.[0] ?? ''), args: e.args ?? [] } as DebugLogEntry;
-            pushDebugLog(entry);
-          }
-          sendResponse({ success: true });
-        } catch (err) {
-          sendResponse({ success: false, error: (err as Error).message });
+      try {
+        const payload = message.payload as DebugLogEntry | DebugLogEntry[] | undefined;
+        if (!payload) {
+          sendResponse({ success: false, error: 'No payload' });
+          return true;
         }
-      })();
+        const entries = Array.isArray(payload) ? payload : [payload];
+        for (const e of entries) {
+          // normalize ts
+          const entry = { ts: e.ts ?? Date.now(), source: e.source ?? 'content', level: e.level ?? 'log', message: e.message ?? String(e.args?.[0] ?? ''), args: e.args ?? [] } as DebugLogEntry;
+          pushDebugLog(entry);
+        }
+        sendResponse({ success: true });
+      } catch (err) {
+        sendResponse({ success: false, error: (err as Error).message });
+      }
       return true;
     }
 
     if (message.action === 'GET_DEBUG_LOGS') {
-      void (async () => {
-        try {
-          // return a shallow copy
-          sendResponse({ success: true, data: debugLogs.slice() });
-        } catch (err) {
-          sendResponse({ success: false, error: (err as Error).message });
-        }
-      })();
+      try {
+        // return a shallow copy
+        sendResponse({ success: true, data: debugLogs.slice() });
+      } catch (err) {
+        sendResponse({ success: false, error: (err as Error).message });
+      }
       return true;
     }
 
     if (message.action === 'CLEAR_DEBUG_LOGS') {
-      void (async () => {
-        try {
-          debugLogs.length = 0;
-          sendResponse({ success: true });
-        } catch (err) {
-          sendResponse({ success: false, error: (err as Error).message });
-        }
-      })();
+      try {
+        debugLogs.length = 0;
+        sendResponse({ success: true });
+      } catch (err) {
+        sendResponse({ success: false, error: (err as Error).message });
+      }
       return true;
     }
 
@@ -369,9 +371,9 @@ chrome.runtime.onMessage.addListener(
 // Keep the service worker alive during long async operations
 // (Chrome MV3 service workers may be terminated otherwise)
 chrome.runtime.onInstalled.addListener(({ reason }) => {
-  if (reason === 'install') {
+  if (reason === chrome.runtime.OnInstalledReason.INSTALL) {
     console.info('[FDF Pro] Extension installed.');
-  } else if (reason === 'update') {
+  } else if (reason === chrome.runtime.OnInstalledReason.UPDATE) {
     console.info('[FDF Pro] Extension updated.');
   }
 });
@@ -390,6 +392,23 @@ async function getSettings(): Promise<Settings> {
     // Ignore storage errors and fall back to defaults
   }
   return { ...DEFAULT_SETTINGS };
+}
+
+// -----------------------------------------------------------
+// Domain blocklist — checked here too, not just in the content
+// script, so a toolbar click or an active chaining session can never
+// fill a form on a blocklisted domain (e.g. banking sites) even if the
+// content script's own gate is bypassed or hasn't loaded yet.
+// -----------------------------------------------------------
+
+function isUrlBlocked(url: string | undefined, blacklist: string[]): boolean {
+  if (!url) return false;
+  try {
+    return matchesHostnameList(new URL(url).hostname, blacklist);
+  } catch (e) {
+    logSwallowed('src/background/index.ts:isUrlBlocked', e);
+    return false;
+  }
 }
 
 // -----------------------------------------------------------
@@ -469,6 +488,19 @@ async function processAnalyzeResponse(
 // -----------------------------------------------------------
 
 async function fillForms(tabId: number, forms: FormAnalysis[], settings: Settings): Promise<void> {
+  // Single choke point for every fill path (toolbar click, hotkey, and
+  // chaining) — never fill a blocklisted domain, regardless of how the
+  // fill was triggered or whether the content script's own gate ran.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (isUrlBlocked(tab.url, settings.domainBlacklist)) {
+      console.info('[FDF Pro] fillForms: blocked domain, refusing to fill on tab', tabId, tab.url);
+      return;
+    }
+  } catch (e) {
+    logSwallowed('src/background/index.ts:fillForms:blocklist-check', e);
+  }
+
   for (const formAnalysis of forms) {
     try {
       const enriched = await handler.generateDataForFormDirect(formAnalysis);
@@ -491,7 +523,7 @@ async function fillForms(tabId: number, forms: FormAnalysis[], settings: Setting
                 if (chrome.runtime.lastError) return;
                 const t = (store.telemetry as { fillCount?: number }) ?? { fillCount: 0 };
                 t.fillCount = (t.fillCount ?? 0) + 1;
-                chrome.storage.local.set({ telemetry: t });
+                void chrome.storage.local.set({ telemetry: t });
               });
             }
             resolve();
@@ -529,19 +561,21 @@ async function fillForms(tabId: number, forms: FormAnalysis[], settings: Setting
 }
 
 // Keyboard shortcut support: trigger the same action when a command fires.
-chrome.commands?.onCommand.addListener(async (command) => {
+chrome.commands?.onCommand.addListener((command) => {
   if (command !== 'trigger-fill') return;
-  try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tabs || !tabs[0] || !tabs[0].id) return;
-    const tabId = tabs[0].id;
-    chrome.tabs.sendMessage(tabId, { action: 'ANALYZE_FORMS' }, (resp) => {
-      if (chrome.runtime.lastError) return;
-      void processAnalyzeResponse(tabId, resp as ExtensionResponse<FormAnalysis[]>);
-    });
-  } catch {
-    // ignore
-  }
+  void (async () => {
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs || !tabs[0] || !tabs[0].id) return;
+      const tabId = tabs[0].id;
+      chrome.tabs.sendMessage(tabId, { action: 'ANALYZE_FORMS' }, (resp) => {
+        if (chrome.runtime.lastError) return;
+        void processAnalyzeResponse(tabId, resp as ExtensionResponse<FormAnalysis[]>);
+      });
+    } catch (e) {
+      logSwallowed('src/background/index.ts:onCommand', e);
+    }
+  })();
 });
 
 // -----------------------------------------------------------
@@ -603,8 +637,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 // Clean up chaining state when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (chainingTabs.has(tabId)) {
-    const entry = chainingTabs.get(tabId)!;
+  const entry = chainingTabs.get(tabId);
+  if (entry) {
     if (entry.timeoutId) clearTimeout(entry.timeoutId);
     chainingTabs.delete(tabId);
     chainLogs.delete(tabId);

@@ -1,23 +1,25 @@
 import type {
-  EncryptedBlob,
   Profile,
   ProfileData,
   SupportedLocale,
 } from '@/shared/types';
-import { STORAGE_KEYS, LIMITS } from '@/shared/constants';
+import { STORAGE_KEYS, LIMITS, SUPPORTED_LOCALES } from '@/shared/constants';
 import { generateId, deepClone } from '@/shared/utils';
+import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // ProfileManager
-// Uses AES-256-GCM (Web Crypto) to encrypt profiles at rest.
-// The encryption key material is stored alongside the encrypted
-// data in chrome.storage.local—this protects against
-// casual inspection of exported storage snapshots.
+// Profiles are stored as plaintext JSON in chrome.storage.local.
+//
+// NOTE: A previous version applied AES-256-GCM encryption, but the key
+// material was stored alongside the ciphertext in the same storage area,
+// which provided no meaningful isolation. The encryption layer has been
+// removed to avoid false security assurances. Profiles do not contain
+// credentials or financial data — they hold display preferences only.
 // =============================================================
 
 export class ProfileManager {
   private profiles = new Map<string, Profile>();
-  private cryptoKey: CryptoKey | null = null;
   private ready: Promise<void>;
 
   constructor() {
@@ -29,7 +31,6 @@ export class ProfileManager {
   // -----------------------------------------------------------
 
   private async init(): Promise<void> {
-    this.cryptoKey = await this.loadOrCreateKey();
     await this.loadAllProfiles();
   }
 
@@ -148,85 +149,20 @@ export class ProfileManager {
       throw new Error('JSON does not look like a valid profile.');
     }
 
+    // Validate locale against the supported allowlist to prevent arbitrary
+    // locale strings from being injected via imported profile JSON.
+    const rawLocale = data.locale as string | undefined;
+    const locale: SupportedLocale = SUPPORTED_LOCALES.includes(rawLocale as SupportedLocale)
+      ? (rawLocale as SupportedLocale)
+      : 'en-US';
+
     // Assign a fresh ID to avoid conflicts
     return this.create(String(data.name), data.data as ProfileData, {
-      locale: data.locale as SupportedLocale,
-      description: data.description as string | undefined,
-      tags: data.tags as string[] | undefined,
+      locale,
+      description: typeof data.description === 'string' ? data.description : undefined,
+      tags: Array.isArray(data.tags) ? (data.tags as string[]).filter((t) => typeof t === 'string') : undefined,
       template: Boolean(data.template),
     });
-  }
-
-  // -----------------------------------------------------------
-  // Encryption (AES-256-GCM via Web Crypto)
-  // -----------------------------------------------------------
-
-  private async encrypt(plainObj: unknown): Promise<EncryptedBlob> {
-    if (!this.cryptoKey) throw new Error('CryptoKey not initialised.');
-
-    const enc = new TextEncoder();
-    const data = enc.encode(JSON.stringify(plainObj));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-
-    const cipherBuffer = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      this.cryptoKey,
-      data,
-    );
-
-    return {
-      iv: Array.from(iv),
-      ciphertext: Array.from(new Uint8Array(cipherBuffer)),
-    };
-  }
-
-  private async decrypt(blob: EncryptedBlob): Promise<unknown> {
-    if (!this.cryptoKey) throw new Error('CryptoKey not initialised.');
-
-    const iv = new Uint8Array(blob.iv);
-    const ciphertext = new Uint8Array(blob.ciphertext);
-
-    const plainBuffer = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv },
-      this.cryptoKey,
-      ciphertext,
-    );
-
-    const dec = new TextDecoder();
-    return JSON.parse(dec.decode(plainBuffer));
-  }
-
-  // -----------------------------------------------------------
-  // Key management
-  // -----------------------------------------------------------
-
-  private async loadOrCreateKey(): Promise<CryptoKey> {
-    const stored = await chrome.storage.local.get(STORAGE_KEYS.ENCRYPTION_KEY);
-    const raw = stored[STORAGE_KEYS.ENCRYPTION_KEY] as number[] | undefined;
-
-    if (raw && raw.length === 32) {
-      return crypto.subtle.importKey(
-        'raw',
-        new Uint8Array(raw),
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt'],
-      );
-    }
-
-    // Generate a fresh 256-bit key
-    const key = await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 },
-      true,
-      ['encrypt', 'decrypt'],
-    );
-
-    const exported = await crypto.subtle.exportKey('raw', key);
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.ENCRYPTION_KEY]: Array.from(new Uint8Array(exported)),
-    });
-
-    return key;
   }
 
   // -----------------------------------------------------------
@@ -234,8 +170,10 @@ export class ProfileManager {
   // -----------------------------------------------------------
 
   private async persistProfile(profile: Profile): Promise<void> {
-    const blob = await this.encrypt(profile);
-    await chrome.storage.local.set({ [STORAGE_KEYS.profileKey(profile.id)]: blob });
+    // Profiles are stored as plaintext JSON objects. The previous AES-GCM
+    // encryption scheme offered no real security because the key was stored
+    // in the same chrome.storage.local namespace as the ciphertext.
+    await chrome.storage.local.set({ [STORAGE_KEYS.profileKey(profile.id)]: profile });
   }
 
   private async loadAllProfiles(): Promise<void> {
@@ -248,15 +186,25 @@ export class ProfileManager {
     const stored = await chrome.storage.local.get(keys);
 
     for (const id of ids) {
-      const blob = stored[STORAGE_KEYS.profileKey(id)] as EncryptedBlob | undefined;
-      if (!blob) continue;
+      const entry: unknown = stored[STORAGE_KEYS.profileKey(id)];
+      if (!entry) continue;
       try {
-        const profile = (await this.decrypt(blob)) as Profile;
+        // Legacy format check: prior builds stored an EncryptedBlob { iv, ciphertext }.
+        // These cannot be decrypted without the now-removed key infrastructure,
+        // so they are skipped with a warning. Users need to recreate them.
+        if (isLegacyEncryptedBlob(entry)) {
+          try { console.warn('[FDF Pro] Skipping legacy encrypted profile', id, '– please recreate it.'); } catch (e) { logSwallowed('src/background/profile-manager.ts', e); }
+          continue;
+        }
+        const profile = entry as Profile;
         this.profiles.set(profile.id, profile);
       } catch {
-        // Decryption failed (e.g. key was regenerated) – skip entry
+        // Skip corrupted entries silently
       }
     }
+
+    // Clean up legacy key material — it provided no real isolation.
+    try { await chrome.storage.local.remove(STORAGE_KEYS.ENCRYPTION_KEY); } catch (e) { logSwallowed('src/background/profile-manager.ts', e); }
   }
 
   private async saveProfileIds(): Promise<void> {
@@ -267,7 +215,7 @@ export class ProfileManager {
 }
 
 // -----------------------------------------------------------
-// Type guard
+// Type guards
 // -----------------------------------------------------------
 
 function isProfileLike(v: unknown): v is Record<string, unknown> {
@@ -277,4 +225,11 @@ function isProfileLike(v: unknown): v is Record<string, unknown> {
     typeof (v as Record<string, unknown>).name === 'string' &&
     typeof (v as Record<string, unknown>).data === 'object'
   );
+}
+
+/** Detect the legacy AES-GCM EncryptedBlob format { iv: number[], ciphertext: number[] }. */
+function isLegacyEncryptedBlob(v: unknown): boolean {
+  if (typeof v !== 'object' || v === null) return false;
+  const obj = v as Record<string, unknown>;
+  return Array.isArray(obj.iv) && Array.isArray(obj.ciphertext);
 }

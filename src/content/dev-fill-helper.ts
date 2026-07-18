@@ -1,17 +1,7 @@
-import type { FormAnalysis } from '@/shared/types';
+import type { ExtensionMessage, ExtensionResponse, FormAnalysis } from '@/shared/types';
 import { FormDetectionEngine } from './form-detection';
 import { FormFiller } from './form-filler';
-
-// Lightweight safe-send wrapper for background messages
-async function sendMessageSafe(msg: unknown): Promise<any> {
-  try {
-    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) return { success: false, error: 'no-runtime' };
-    const res = await chrome.runtime.sendMessage(msg as any);
-    return res ?? { success: false, error: 'no-response' };
-  } catch {
-    return { success: false, error: 'send-failed' };
-  }
-}
+import { sendMessageSafe, logSwallowed } from '@/shared/messaging';
 
 /**
  * Analyze a form by id, request generated values from the background,
@@ -19,7 +9,7 @@ async function sendMessageSafe(msg: unknown): Promise<any> {
  * Returns the fill summary or null on failure.
  */
 export async function fillFormById(id: string): Promise<{ filled: number; skipped: number } | null> {
-  const el = document.getElementById(id) as HTMLElement | null;
+  const el = document.getElementById(id);
   if (!el) {
     console.error('[FDF dev] form not found:', id);
     return null;
@@ -33,14 +23,17 @@ export async function fillFormById(id: string): Promise<{ filled: number; skippe
   }
 
   // Ask background to generate values for the detected form.
-  let genResp: any = null;
+  let genResp: ExtensionResponse<FormAnalysis> | null = null;
   try {
-    genResp = await sendMessageSafe({ action: 'GENERATE_DATA_FOR_FORM', payload: { formAnalysis: analysis } });
+    genResp = await sendMessageSafe<ExtensionMessage, ExtensionResponse<FormAnalysis>>({
+      action: 'GENERATE_DATA_FOR_FORM',
+      payload: { formAnalysis: analysis },
+    });
   } catch (e) {
-    console.debug('[FDF dev] generate request failed', e);
+    logSwallowed('src/content/dev-fill-helper.ts: generate request failed', e);
   }
 
-  const enriched: FormAnalysis = (genResp && genResp.success && genResp.data) ? (genResp.data as FormAnalysis) : analysis;
+  const enriched: FormAnalysis = (genResp && genResp.success && genResp.data) ? genResp.data : analysis;
 
   const filler = new FormFiller();
   const result = await filler.fillForm(enriched);
@@ -49,9 +42,17 @@ export async function fillFormById(id: string): Promise<{ filled: number; skippe
 }
 
 // Expose a global helper for quick manual testing in the page console.
+// Gated to dev builds only — never attach a debug hook to a shipped bundle
+// injected into every page.
 declare global {
-  interface Window { FDF_devFillFormById?: (id: string) => Promise<any>; }
+  interface Window { FDF_devFillFormById?: typeof fillFormById; }
 }
-window.FDF_devFillFormById = fillFormById;
+// Vite replaces `process.env.NODE_ENV` with a literal string at build time
+// (its default esbuild `define`), so the check compiles away to nothing —
+// or a plain `false` guard — in a production bundle rather than leaving a
+// runtime dependency on Node's `process` global inside the page.
+if (process.env.NODE_ENV !== 'production') {
+  window.FDF_devFillFormById = fillFormById;
+}
 
 export default fillFormById;

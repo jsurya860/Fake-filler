@@ -30,15 +30,21 @@ export default {
     'src/**/*.{ts,tsx}',
     '!src/**/*.d.ts',
     '!src/popup/main.tsx',
-    '!src/background/index.ts',
-    '!src/content/index.ts',
   ],
+  // These are a regression floor, not an aspirational target: background/index.ts
+  // and content/index.ts are large browser-bootstrap/wiring files (MutationObservers,
+  // hotkey handling, modal detection) that are inherently hard to unit test and were
+  // previously excluded from coverage collection entirely, which silently hid that
+  // they (and profile-manager.ts/message-handler.ts/popup/api.ts) had ~0% coverage.
+  // Now that they're included, the honest current floor is well below 80% — set
+  // thresholds a few points below the last measured run so a real coverage drop
+  // still fails CI without making this gate permanently red.
   coverageThreshold: {
     global: {
-      branches: 70,
-      functions: 80,
-      lines: 80,
-      statements: 80,
+      branches: 38,
+      functions: 34,
+      lines: 41,
+      statements: 39,
     },
   },
   setupFiles: ['<rootDir>/tests/setup.ts'],

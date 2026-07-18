@@ -24,6 +24,17 @@ export interface ApiFieldError {
   messages: string[];
 }
 
+/**
+ * DOM event name used to bridge captured errors out of the MAIN world.
+ * `installApiInterceptor()` must run in the page's MAIN world to see the
+ * page's real fetch/XHR calls (see api-interceptor-main.ts) — the isolated
+ * world content script has its own separate fetch/XMLHttpRequest globals
+ * that the page never calls. MAIN and isolated worlds don't share JS module
+ * state, but they do share the DOM, so a CustomEvent on `window` is how the
+ * captured entry crosses back to the isolated-world content script.
+ */
+export const API_ERROR_EVENT = 'fdf-pro:api-error';
+
 /** Ring buffer of recent API error responses */
 const recentApiErrors: ApiErrorEntry[] = [];
 const MAX_ENTRIES = 20;
@@ -171,9 +182,11 @@ function normalizeMessages(val: unknown): string[] {
 // -----------------------------------------------------------
 
 function isErrorStatus(status: number): boolean {
-  // 400 Bad Request, 422 Unprocessable Entity, 409 Conflict are common validation responses
-  // Also catch 401/403 for auth-related form errors
-  return status >= 400 && status < 600;
+  // Only intercept HTTP statuses that indicate field-level validation failures.
+  // 400 Bad Request, 409 Conflict, and 422 Unprocessable Entity are the
+  // standard REST codes for validation errors. 5xx server errors and other
+  // 4xx codes (auth, rate-limit, etc.) should not trigger form-recovery logic.
+  return status === 400 || status === 409 || status === 422;
 }
 
 // -----------------------------------------------------------
@@ -187,6 +200,9 @@ function recordError(entry: ApiErrorEntry): void {
   for (const cb of listeners) {
     try { cb(entry); } catch { /* ignore listener errors */ }
   }
+  try {
+    window.dispatchEvent(new CustomEvent<ApiErrorEntry>(API_ERROR_EVENT, { detail: entry }));
+  } catch { /* ignore — e.g. CustomEvent unavailable in a non-DOM test environment */ }
 }
 
 // -----------------------------------------------------------
@@ -214,9 +230,9 @@ export function installApiInterceptor(): void {
         // Read text async — don't block the caller
         void clone.text().then((text) => {
           try {
-            const json = JSON.parse(text);
+            const json: unknown = JSON.parse(text);
             const { fieldErrors, message } = parseApiErrors(json);
-            const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input).url;
             recordError({
               url,
               status: response.status,
@@ -232,7 +248,9 @@ export function installApiInterceptor(): void {
   };
 
   // ---- XMLHttpRequest interceptor ----
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called via .call() below, never as a bare reference
   const origOpen = XMLHttpRequest.prototype.open;
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called via .call() below, never as a bare reference
   const origSend = XMLHttpRequest.prototype.send;
   const urlMap = new WeakMap<XMLHttpRequest, string>();
 
@@ -243,7 +261,12 @@ export function installApiInterceptor(): void {
     ...rest: unknown[]
   ): void {
     urlMap.set(this, typeof url === 'string' ? url : url.href);
-    return (origOpen as Function).call(this, method, url, ...rest);
+    (origOpen as (this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) => void).call(
+      this,
+      method,
+      url,
+      ...rest,
+    );
   };
 
   XMLHttpRequest.prototype.send = function patchedSend(
@@ -256,7 +279,7 @@ export function installApiInterceptor(): void {
           const text = this.responseText;
           if (text) {
             try {
-              const json = JSON.parse(text);
+              const json: unknown = JSON.parse(text);
               const { fieldErrors, message } = parseApiErrors(json);
               recordError({
                 url: urlMap.get(this) ?? '',

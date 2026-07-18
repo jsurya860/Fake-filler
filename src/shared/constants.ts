@@ -32,6 +32,16 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = {
 };
 
 // =============================================================
+// Supported Locale Runtime Array
+// Mirrors the SupportedLocale union type for runtime validation.
+// =============================================================
+
+export const SUPPORTED_LOCALES: readonly SupportedLocale[] = [
+  'en-US', 'en-GB', 'de-DE', 'fr-FR', 'es-ES', 'it-IT',
+  'pt-BR', 'ja-JP', 'ko-KR', 'zh-CN', 'ru-RU', 'nl-NL', 'pl-PL', 'sv-SE',
+] as const;
+
+// =============================================================
 // Locale → Phone Format Map
 // =============================================================
 

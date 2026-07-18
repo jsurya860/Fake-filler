@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import type { Settings, SupportedLocale, FillSensitivity } from '@/shared/types';
 import { sendToBackground } from '../api';
 import { LOCALES } from '@/shared/constants';
+import { logSwallowed } from '@/shared/messaging';
 
 interface SettingsPanelProps {
   settings: Settings;
@@ -82,6 +83,12 @@ export function SettingsPanel({ settings, onChange }: SettingsPanelProps): JSX.E
         onChange={(v) => update('skipLoginForms', v)}
       />
       <Toggle
+        label="Skip payment forms"
+        hint="Never fill forms that look like checkout/payment pages."
+        checked={settings.skipPaymentForms}
+        onChange={(v) => update('skipPaymentForms', v)}
+      />
+      <Toggle
         label="Preview before fill"
         hint="Show generated data before inserting it."
         checked={settings.showPreviewBeforeFill}
@@ -154,11 +161,13 @@ export function SettingsPanel({ settings, onChange }: SettingsPanelProps): JSX.E
       <div style={{ marginTop: 12 }}>
         <button
           className="btn btn--link"
-          onClick={async () => {
-            try {
-              await sendToBackground({ action: 'DISABLE_CHAINING' });
-              // noop — popup will poll and update state
-            } catch {}
+          onClick={() => {
+            void (async () => {
+              try {
+                await sendToBackground({ action: 'DISABLE_CHAINING' });
+                // noop — popup will poll and update state
+              } catch (e) { logSwallowed('src/popup/components/SettingsPanel.tsx', e); }
+            })();
           }}
         >
           ⛔ Stop chaining now
@@ -238,6 +247,8 @@ function Toggle({
 function HotkeySetter({ onSave, onClear }: { onSave: (k: string) => void; onClear: () => void }): JSX.Element {
   const [capturing, setCapturing] = useState(false);
   const [hint, setHint] = useState('');
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
 
   useEffect(() => {
     let timeout: ReturnType<typeof setTimeout> | null = null;
@@ -261,7 +272,7 @@ function HotkeySetter({ onSave, onClear }: { onSave: (k: string) => void; onClea
       if (key && key.length > 0) parts.push(key);
       const canonical = parts.join('+');
       if (canonical) {
-        onSave(canonical);
+        onSaveRef.current(canonical);
       }
       setCapturing(false);
     }
@@ -277,7 +288,7 @@ function HotkeySetter({ onSave, onClear }: { onSave: (k: string) => void; onClea
 
     return () => {
       if (timeout) clearTimeout(timeout);
-      window.removeEventListener('keydown', onKey, { capture: true } as any);
+      window.removeEventListener('keydown', onKey, { capture: true });
     };
   }, [capturing]);
 

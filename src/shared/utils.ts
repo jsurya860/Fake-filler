@@ -1,3 +1,4 @@
+import { logSwallowed } from '@/shared/messaging';
 /**
  * Shared utility functions used across background, content, and popup modules.
  * No DOM-specific APIs – safe to import anywhere.
@@ -36,6 +37,7 @@ export function randomInt(min: number, max: number): number {
 
 /** Pick a random element from an array */
 export function pick<T>(arr: T[]): T {
+  if (arr.length === 0) throw new RangeError('pick() called with an empty array');
   return arr[randomInt(0, arr.length - 1)];
 }
 
@@ -83,11 +85,15 @@ export function toISODate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-/** Return a random Date between two dates */
+/** Return a random Date between two dates using a cryptographically random offset */
 export function randomDate(from: Date, to: Date): Date {
   const start = from.getTime();
   const end = to.getTime();
-  return new Date(start + Math.random() * (end - start));
+  const range = end - start;
+  if (range <= 0) return new Date(start);
+  // Distribute over 1 000 000 discrete points for a crypto-random result
+  const slots = 1_000_000;
+  return new Date(start + Math.floor((randomInt(0, slots) / slots) * range));
 }
 
 // =============================================================
@@ -110,7 +116,7 @@ export function hostnameFromUrl(url: string): string {
   try {
     return new URL(url).hostname;
   } catch (e) {
-    try { console.debug('[FDF Pro] hostnameFromUrl parse failed', e); } catch {}
+    try { console.debug('[FDF Pro] hostnameFromUrl parse failed', e); } catch (e) { logSwallowed('src/shared/utils.ts', e); }
     return '';
   }
 }
@@ -124,6 +130,31 @@ export function matchesHostnameList(hostname: string, list: string[]): boolean {
     }
     return hostname === entry || hostname.endsWith(`.${entry}`);
   });
+}
+
+/**
+ * True if a hostname is loopback or a private-network address (RFC 1918 /
+ * link-local / unique-local IPv6). Used to catch an almost-certainly-wrong
+ * user-configured outbound endpoint (e.g. a telemetry URL), not as a general
+ * security boundary — a determined attacker with control of the value has
+ * far more direct options than this check would meaningfully block.
+ */
+export function isLoopbackOrPrivateHostname(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  if (h === 'localhost' || h === '::1') return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 127) return true; // loopback
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 169 && b === 254) return true; // link-local
+    return false;
+  }
+  if (h.startsWith('fc') || h.startsWith('fd')) return true; // IPv6 unique-local
+  if (h.startsWith('fe80:')) return true; // IPv6 link-local
+  return false;
 }
 
 // =============================================================

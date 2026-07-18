@@ -19,10 +19,11 @@
     "react": { "version": "detect" }
   },
   "rules": {
+    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
     "@typescript-eslint/no-explicit-any": "error",
     "@typescript-eslint/no-non-null-assertion": "warn",
     "@typescript-eslint/consistent-type-imports": ["error", { "prefer": "type-imports" }],
-    "no-console": ["warn", { "allow": ["info", "warn", "error"] }],
+    "no-console": ["warn", { "allow": ["info", "warn", "error", "debug"] }],
     "react/react-in-jsx-scope": "off",
     "react/prop-types": "off",
     "@typescript-eslint/no-floating-promises": "error",

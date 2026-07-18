@@ -1,6 +1,7 @@
 import {
   Faker,
   en,
+  en_GB,
   de,
   fr,
   es,
@@ -36,6 +37,7 @@ import {
   isLuhnValid,
   generateId,
 } from '@/shared/utils';
+import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // Locale → Faker locale mapping
@@ -43,7 +45,7 @@ import {
 
 const LOCALE_MAP: Record<SupportedLocale, LocaleDefinition> = {
   'en-US': en,
-  'en-GB': en,
+  'en-GB': en_GB,
   'de-DE': de,
   'fr-FR': fr,
   'es-ES': es,
@@ -131,11 +133,10 @@ export class DataGenerator {
       const sample: Record<string, string> = {};
       for (const [k, v] of Array.from(results.entries()).slice(0, 10)) sample[k] = v;
       // Service worker console
-      // eslint-disable-next-line no-console
       console.info('[FDF Pro] Generated values sample:', sample,
         { skipped: skippedFields, retired: retiredFields });
     } catch (e) {
-      try { console.debug('[FDF Pro] Generated sample logging failed', e); } catch {}
+      try { console.debug('[FDF Pro] Generated sample logging failed', e); } catch (e) { logSwallowed('src/background/data-generator.ts', e); }
     }
 
     return results;
@@ -351,7 +352,7 @@ export class DataGenerator {
                 }
               }
             }
-          } catch {}
+          } catch (e) { logSwallowed('src/background/data-generator.ts', e); }
         }
         value = phone;
         break;
@@ -611,7 +612,7 @@ export class DataGenerator {
         if (code === '+81') return replacePlaceholders(PHONE_FORMATS['ja-JP']);
         if (code === '+86') return replacePlaceholders(PHONE_FORMATS['zh-CN']);
       }
-    } catch {}
+    } catch (e) { logSwallowed('src/background/data-generator.ts', e); }
 
     // Fallback to generator locale
     return this.generatePhone();

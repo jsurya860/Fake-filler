@@ -7,7 +7,6 @@
   "scripts": {
     "dev": "vite build --watch",
     "build": "vite build && node ./scripts/sanitize-dist.mjs",
-    "postbuild": "npm test",
     "build-and-test": "npm run build && npm test",
     "preview": "vite preview",
     "test": "jest --passWithNoTests",

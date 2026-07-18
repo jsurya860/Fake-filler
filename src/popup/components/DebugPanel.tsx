@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DebugLogEntry } from '@/shared/types';
 import { sendToBackground } from '../api';
+import { logSwallowed } from '@/shared/messaging';
 
 export function DebugPanel(): JSX.Element {
   const [logs, setLogs] = useState<DebugLogEntry[]>([]);
@@ -16,7 +17,7 @@ export function DebugPanel(): JSX.Element {
         const resp = await sendToBackground<DebugLogEntry[]>({ action: 'GET_DEBUG_LOGS' });
         if (!mounted) return;
         if (resp.success && resp.data) setLogs(resp.data);
-      } catch {}
+      } catch (e) { logSwallowed('src/popup/components/DebugPanel.tsx', e); }
     }
 
     if (running) {
@@ -42,7 +43,7 @@ export function DebugPanel(): JSX.Element {
         <div style={{ flex: 1 }} />
         <button
           className="btn btn--tiny"
-          onClick={async () => {
+          onClick={() => {
             setRunning((r) => !r);
           }}
         >
@@ -50,11 +51,13 @@ export function DebugPanel(): JSX.Element {
         </button>
         <button
           className="btn btn--tiny"
-          onClick={async () => {
-            try {
-              await sendToBackground({ action: 'CLEAR_DEBUG_LOGS' });
-              setLogs([]);
-            } catch {}
+          onClick={() => {
+            void (async () => {
+              try {
+                await sendToBackground({ action: 'CLEAR_DEBUG_LOGS' });
+                setLogs([]);
+              } catch (e) { logSwallowed('src/popup/components/DebugPanel.tsx', e); }
+            })();
           }}
           style={{ marginLeft: 6 }}
         >

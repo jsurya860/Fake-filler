@@ -15,6 +15,7 @@ import {
   SECTION_HEADING_PATTERNS,
 } from '@/shared/constants';
 import { generateId } from '@/shared/utils';
+import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // FormDetectionEngine
@@ -23,6 +24,11 @@ import { generateId } from '@/shared/utils';
 
 export class FormDetectionEngine {
   private formCounter = 0;
+
+  /** Reset the internal form counter. Call between test cases or page navigations. */
+  resetFormCounter(): void {
+    this.formCounter = 0;
+  }
 
   // -----------------------------------------------------------
   // Public: scan the whole page
@@ -50,45 +56,44 @@ export class FormDetectionEngine {
     const timeoutMs = options?.timeoutMs ?? 1500;
     const settleMs = options?.settleMs ?? 250;
 
-    const self = this;
     return new Promise<FormAnalysis[]>((resolve) => {
-      let settledTimer: number | null = null;
-      let overallTimer: number | null = null;
+      let settledTimer: ReturnType<typeof setTimeout> | null = null;
+      let overallTimer: ReturnType<typeof setTimeout> | null = null;
 
-      function clearTimers() {
-        try { if (settledTimer) clearTimeout(settledTimer); } catch {}
-        try { if (overallTimer) clearTimeout(overallTimer); } catch {}
-      }
+      const clearTimers = () => {
+        try { if (settledTimer !== null) clearTimeout(settledTimer); } catch (e) { logSwallowed('src/content/form-detection.ts', e); }
+        try { if (overallTimer !== null) clearTimeout(overallTimer); } catch (e) { logSwallowed('src/content/form-detection.ts', e); }
+      };
 
       const observer = new MutationObserver(() => {
         // Reset settle timer on each mutation
-        try { if (settledTimer) clearTimeout(settledTimer); } catch {}
-        settledTimer = window.setTimeout(finish, settleMs);
+        try { if (settledTimer !== null) clearTimeout(settledTimer); } catch (e) { logSwallowed('src/content/form-detection.ts', e); }
+        settledTimer = setTimeout(finish, settleMs);
       });
 
-      function finish() {
+      const finish = () => {
         observer.disconnect();
         clearTimers();
         // Return the latest detection
-        resolve(self.detectForms());
-      }
+        resolve(this.detectForms());
+      };
 
       // Start observing the whole document body for additions/changes
       try {
         observer.observe(document.body, { childList: true, subtree: true, attributes: true });
       } catch {
         // If observe fails (e.g., test env), just resolve immediately
-        resolve(self.detectForms());
+        resolve(this.detectForms());
         return;
       }
 
       // Kick off timers: if no mutations occur, settle after settleMs
-      settledTimer = window.setTimeout(finish, settleMs);
-      overallTimer = window.setTimeout(() => {
+      settledTimer = setTimeout(finish, settleMs);
+      overallTimer = setTimeout(() => {
         // Timeout reached — return whatever we have
-        try { observer.disconnect(); } catch {}
+        try { observer.disconnect(); } catch (e) { logSwallowed('src/content/form-detection.ts', e); }
         clearTimers();
-        resolve(self.detectForms());
+        resolve(this.detectForms());
       }, timeoutMs);
     });
   }
@@ -367,7 +372,7 @@ export class FormDetectionEngine {
           multiselectContainer.querySelectorAll<HTMLElement>('.multiselect__element'),
         ).filter((li) => {
           // Skip hidden placeholder items
-          if ((li as HTMLElement).style?.display === 'none') return false;
+          if ((li).style?.display === 'none') return false;
           // Must have role="option" or contain an option span
           if (li.getAttribute('role') === 'option' || li.querySelector('[role="option"]')) return true;
           return false;
@@ -1053,8 +1058,9 @@ export class FormDetectionEngine {
         path.unshift(selector);
         break;
       } else {
+        const currentTag = node.tagName;
         const siblings = Array.from(node.parentElement?.children ?? []).filter(
-          (s) => s.tagName === node!.tagName,
+          (s) => s.tagName === currentTag,
         );
         if (siblings.length > 1) {
           const idx = siblings.indexOf(node) + 1;

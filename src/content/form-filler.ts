@@ -1,15 +1,14 @@
-import type { FieldAnalysis, FormAnalysis, ErrorType } from '@/shared/types';
+import type {
+  FieldAnalysis,
+  FormAnalysis,
+  ErrorType,
+  ExtensionMessage,
+  ExtensionResponse,
+  DetectErrorsResult,
+} from '@/shared/types';
 import { ERROR_SELECTORS, DEFAULT_SETTINGS } from '@/shared/constants';
-
-// Lightweight safe-send helper (mirrors the one in index.ts) so
-// form-filler never throws when the service worker is unavailable.
-async function sendMessageSafe(msg: unknown): Promise<any> {
-  try {
-    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) return { success: false, error: 'no-runtime' };
-    const res = await chrome.runtime.sendMessage(msg as any);
-    return res ?? { success: false, error: 'no-response' };
-  } catch { return { success: false, error: 'send-failed' }; }
-}
+import { sendMessageSafe, logSwallowed } from '@/shared/messaging';
+import { randomInt } from '@/shared/utils';
 
 // =============================================================
 // FormFiller
@@ -18,23 +17,35 @@ async function sendMessageSafe(msg: unknown): Promise<any> {
 // firing the right synthetic events for each framework.
 // =============================================================
 
-// Cache native value setters so React's synthetic events fire correctly
+// Cache native value setters so React's synthetic events fire correctly.
+// Each is called via .call(element, value) at the use site, never as a bare
+// reference, so unbound-`this` scoping is not a real risk here.
+// eslint-disable-next-line @typescript-eslint/unbound-method
 const nativeInputSetter = Object.getOwnPropertyDescriptor(
   window.HTMLInputElement.prototype,
   'value',
 )?.set;
 
+// eslint-disable-next-line @typescript-eslint/unbound-method
 const nativeTextareaSetter = Object.getOwnPropertyDescriptor(
   window.HTMLTextAreaElement.prototype,
   'value',
 )?.set;
 
+// eslint-disable-next-line @typescript-eslint/unbound-method
 const nativeSelectSetter = Object.getOwnPropertyDescriptor(
   window.HTMLSelectElement.prototype,
   'value',
 )?.set;
 
 export class FormFiller {
+  /**
+   * Delay in milliseconds between filling individual fields.
+   * The default 30 ms lets validation libraries react before the next field
+   * is written. Set to 0 in test environments to keep tests fast.
+   */
+  interFieldDelayMs = 30;
+
   // -----------------------------------------------------------
   // Fill all fields in a form analysis
   // -----------------------------------------------------------
@@ -43,24 +54,20 @@ export class FormFiller {
     // Perform multiple passes to handle fields that depend on previous inputs
     // (e.g. country -> state dropdown population). We attempt up to
     // `maxPasses` rounds and stop early if no progress is made.
-    const interFieldDelay = (typeof process !== 'undefined' && (process.env.JEST_WORKER_ID || process.env.NODE_ENV === 'test')) ? 0 : 30;
+    const interFieldDelay = this.interFieldDelayMs;
     const maxPasses = 3;
 
+    // Use selector as the dedup key because field.id can be an empty string
+    // for fields that lack an HTML id attribute, causing collisions.
     const filledSet = new Set<string>();
-    // Pre-mark fields that should be skipped (explicit skip or no provided value)
     const allFields = formAnalysis.fields ?? [];
-    for (const f of allFields) {
-      if (f.skip || f.value === undefined || f.value === null) {
-        // leave as not-fillable; they'll count as skipped at the end
-        continue;
-      }
-    }
 
     for (let pass = 0; pass < maxPasses; pass++) {
       let progress = false;
 
       for (const field of allFields) {
-        if (filledSet.has(field.id)) continue;
+        const dedupKey = field.selector || field.id;
+        if (filledSet.has(dedupKey)) continue;
         if (field.skip || field.value === undefined || field.value === null) continue;
 
         const el = this.resolveElement(field.selector);
@@ -72,7 +79,7 @@ export class FormFiller {
 
         const success = await this.fillField(el, field);
         if (success) {
-          filledSet.add(field.id);
+          filledSet.add(dedupKey);
           progress = true;
         }
 
@@ -96,7 +103,7 @@ export class FormFiller {
     el: HTMLElement,
     field: FieldAnalysis,
   ): Promise<boolean> {
-    if (!field.value) return false;
+    if (!field.value && !['select', 'checkbox', 'radio'].includes(field.type ?? '')) return false;
 
     // Skip read-only and disabled elements — they cannot accept user input
     const inputEl = el as HTMLInputElement;
@@ -105,14 +112,14 @@ export class FormFiller {
 
       try {
         // Debug log which field and value we're about to set
-        try { console.debug('[FDF Pro] fillField:', field.selector, '=>', field.value); } catch {}
+        try { console.debug('[FDF Pro] fillField:', field.selector, '=>', field.value); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
         // Precompute whether this field looks like a telephone/mobile input
         const isTelField = (inputEl.type === 'tel') || field.type === 'phone' || /phone|mobile|tel|contact/i.test((field.name || '') + ' ' + (field.label || ''));
 
       // Handle selects (native and custom) by field.type first
       if (field.type === 'select') {
-        return await this.fillSelect(el as any, String(field.value));
+        return await this.fillSelect(el, String(field.value ?? ''));
       }
 
       // Handle custom display-only containers (e.g., vue-multiselect) where the
@@ -122,7 +129,7 @@ export class FormFiller {
       if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
         try {
           // Common display selectors for custom selects
-          const display = el.querySelector('.multiselect__single, .vs__selected, .Select__single-value, .chosen-single, .select2-selection__rendered') as HTMLElement | null;
+          const display = el.querySelector('.multiselect__single, .vs__selected, .Select__single-value, .chosen-single, .select2-selection__rendered');
           // Prefer an existing FDF-managed hidden input for stability
           let hiddenInput = el.querySelector<HTMLInputElement>(`input[data-fdf-field-id="${field.id}"]`)
             ?? el.querySelector<HTMLInputElement>('input[type="hidden"][name], input[name]')
@@ -148,49 +155,49 @@ export class FormFiller {
               
               // Set hidden input value so form submissions and generators can read it
                 try {
-                let hiddenVal = String(field.value);
+                let hiddenVal = String(field.value ?? '');
                 if (isTelField) hiddenVal = hiddenVal.replace(/\D/g, '');
                 nativeInputSetter?.call(hiddenInput, hiddenVal);
-                try { hiddenInput.value = hiddenVal; } catch {}
+                try { hiddenInput.value = hiddenVal; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
                 this.dispatch(hiddenInput, 'input');
                 this.dispatch(hiddenInput, 'change');
-              } catch {}
+              } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
               // Also update visible display for immediate UX
-              try { display.textContent = isTelField ? String(field.value).replace(/\D/g, '') : String(field.value); } catch {}
+              try { display.textContent = isTelField ? String(field.value ?? '').replace(/\D/g, '') : String(field.value ?? ''); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               return true;
-            } catch {}
+            } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           }
 
           // If no hidden input, try opening the dropdown and selecting matching option
-          try { el.click(); } catch {}
+          try { el.click(); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           const optionCandidates = Array.from(document.querySelectorAll<HTMLElement>('.multiselect__element li, .multiselect__option, [role="option"], .vs__dropdown-option, .Select__option'));
           if (optionCandidates.length > 0) {
-            const match = optionCandidates.find((c) => (c.textContent || '').trim().toLowerCase() === String(field.value).trim().toLowerCase());
-            const chosen = match ?? optionCandidates[Math.floor(Math.random() * optionCandidates.length)];
-            try { chosen.click(); } catch { try { chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch {} }
+            const match = optionCandidates.find((c) => (c.textContent || '').trim().toLowerCase() === String(field.value ?? '').trim().toLowerCase());
+            const chosen = match ?? optionCandidates[randomInt(0, optionCandidates.length - 1)];
+            try { chosen.click(); } catch { try { chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
             // If we have a hidden input target, set it to a digits-only value for phone fields
             try {
               if (hiddenInput) {
-                let val = String(field.value);
+                let val = String(field.value ?? '');
                 if (isTelField) val = val.replace(/\D/g, '');
                 nativeInputSetter?.call(hiddenInput, val);
-                try { hiddenInput.value = val; } catch {}
+                try { hiddenInput.value = val; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
                 this.dispatch(hiddenInput, 'input');
                 this.dispatch(hiddenInput, 'change');
               }
-            } catch {}
+            } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
             return true;
           }
-        } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       }
 
       if ((el as HTMLInputElement).type === 'checkbox') {
-        return this.fillCheckbox(el as HTMLInputElement, String(field.value));
+        return this.fillCheckbox(el as HTMLInputElement, String(field.value ?? 'true'));
       }
 
       if ((el as HTMLInputElement).type === 'radio' || field.htmlType === 'radiogroup' || el.getAttribute('role') === 'radiogroup') {
-        return this.fillRadio(el as HTMLInputElement, String(field.value));
+        return this.fillRadio(el as HTMLInputElement, String(field.value ?? ''));
       }
 
       if ((el as HTMLInputElement).type === 'file') {
@@ -198,7 +205,7 @@ export class FormFiller {
       }
 
       if ((el as HTMLInputElement).type === 'date') {
-        return this.fillDateInput(el as HTMLInputElement, String(field.value));
+        return this.fillDateInput(el as HTMLInputElement, String(field.value ?? ''));
       }
 
       // Handle time, datetime-local, month, week via native setter
@@ -206,64 +213,61 @@ export class FormFiller {
       // produced a mismatched format (e.g. lorem text for a time input)
       const inputType = (el as HTMLInputElement).type;
       if (inputType === 'time') {
-        const coerced = this.coerceToTime(String(field.value));
+        const coerced = this.coerceToTime(String(field.value ?? ''));
         return this.fillDateInput(el as HTMLInputElement, coerced);
       }
       if (inputType === 'datetime-local') {
-        const coerced = this.coerceToDatetimeLocal(String(field.value));
+        const coerced = this.coerceToDatetimeLocal(String(field.value ?? ''));
         return this.fillDateInput(el as HTMLInputElement, coerced);
       }
       if (inputType === 'month') {
-        const coerced = this.coerceToMonth(String(field.value));
+        const coerced = this.coerceToMonth(String(field.value ?? ''));
         return this.fillDateInput(el as HTMLInputElement, coerced);
       }
       if (inputType === 'week') {
-        const coerced = this.coerceToWeek(String(field.value));
+        const coerced = this.coerceToWeek(String(field.value ?? ''));
         return this.fillDateInput(el as HTMLInputElement, coerced);
       }
 
       // Standard text / email / tel / password / number / textarea
-      // If this is a telephone/mobile field, coerce to digits only
-      try {
-        const inputEl = el as HTMLInputElement;
-        const isTel = inputEl.type === 'tel' || field.type === 'phone' || /phone|mobile|tel|contact/i.test((field.name || '') + ' ' + (field.label || ''));
-        if (isTel && field.value) {
-          const digits = String(field.value).replace(/\D/g, '');
-          // If we ended up with no digits, fall back to original value
-          const newVal = digits.length > 0 ? digits : String(field.value);
-          field = { ...field, value: newVal } as FieldAnalysis;
-        }
+      // Coerce phone-like fields to digits using the isTelField flag already computed above.
+      // effectiveValue is hoisted outside the try-block so fillTextInput can use it.
+      let effectiveValue = String(field.value ?? '');
+      if (isTelField && effectiveValue) {
+        const digits = effectiveValue.replace(/\D/g, '');
+        // Fall back to original value if stripping leaves nothing (e.g., letter-only placeholder)
+        effectiveValue = digits.length > 0 ? digits : effectiveValue;
+      }
 
-        // If input uses a <datalist>, prefer selecting one of its <option>s
-        try {
-          if ((el as HTMLInputElement).hasAttribute && (el as HTMLInputElement).hasAttribute('list')) {
-            const listId = (el as HTMLInputElement).getAttribute('list');
-            if (listId) {
-              const dl = document.getElementById(listId) as HTMLDataListElement | null;
-              if (dl) {
-                const opts = Array.from(dl.querySelectorAll('option')).map((o) => (o.value ?? '').toString()).filter(Boolean);
-                if (opts.length > 0) {
-                  // Prefer exact match (case-insensitive), else pick first deterministic option
-                  const lower = String(field.value ?? '').trim().toLowerCase();
-                  let chosen = opts.find((o) => o.trim().toLowerCase() === lower) ?? opts[0];
-                  try {
-                    // Use native setter + direct assignment then dispatch events
-                    const val = String(chosen);
-                    nativeInputSetter?.call(el as HTMLInputElement, val);
-                    try { (el as HTMLInputElement).value = val; } catch {}
-                    this.dispatch(el as Element, 'input', val);
-                    this.dispatch(el as Element, 'change');
-                    this.dispatch(el as Element, 'blur');
-                    return true;
-                  } catch {}
-                }
+      // If input uses a <datalist>, prefer selecting one of its <option>s
+      try {
+        if ((el as HTMLInputElement).hasAttribute && (el as HTMLInputElement).hasAttribute('list')) {
+          const listId = (el as HTMLInputElement).getAttribute('list');
+          if (listId) {
+            const dl = document.getElementById(listId) as HTMLDataListElement | null;
+            if (dl) {
+              const opts = Array.from(dl.querySelectorAll('option')).map((o) => (o.value ?? '').toString()).filter(Boolean);
+              if (opts.length > 0) {
+                // Prefer exact match (case-insensitive), else pick first deterministic option
+                const lower = effectiveValue.trim().toLowerCase();
+                const chosen = opts.find((o) => o.trim().toLowerCase() === lower) ?? opts[0];
+                try {
+                  // Use native setter + direct assignment then dispatch events
+                  const val = String(chosen);
+                  nativeInputSetter?.call(el as HTMLInputElement, val);
+                  try { (el as HTMLInputElement).value = val; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+                  this.dispatch(el as Element, 'input', val);
+                  this.dispatch(el as Element, 'change');
+                  this.dispatch(el as Element, 'blur');
+                  return true;
+                } catch (e) { try { console.debug('[FDF Pro] datalist fill failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
               }
             }
           }
-        } catch {}
-      } catch {}
+        }
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
-      return this.fillTextInput(el as HTMLInputElement | HTMLTextAreaElement, String(field.value));
+      return this.fillTextInput(el as HTMLInputElement | HTMLTextAreaElement, effectiveValue);
     } catch {
       return false;
     }
@@ -287,10 +291,10 @@ export class FormFiller {
       const ariaAuto = (el.getAttribute && el.getAttribute('aria-autocomplete')) || '';
       const isComboboxLike = role === 'combobox' || ariaAuto === 'list' || !!el.closest('.react-select') || !!el.closest('.Select') || !!el.closest('[data-reactroot]');
       if (isComboboxLike) {
-        try { el.focus(); } catch {}
-        try { el.click(); } catch {}
+        try { el.focus(); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+        try { el.click(); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         // Give the dropdown a moment to render
-        try { /* fallthrough */ } catch {}
+        try { /* fallthrough */ } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         // Look for visible option-like elements near the page
         const optionSelectors = ['[role="option"]', '.react-select__option', '.Select__option', '.multiselect__option', '.vs__dropdown-option', '.option', '.ant-select-dropdown-item'];
         const candidates: HTMLElement[] = [];
@@ -298,39 +302,49 @@ export class FormFiller {
           try {
             const nodes = Array.from(document.querySelectorAll<HTMLElement>(sel)).filter((n) => n.offsetParent !== null || (typeof process !== 'undefined' && process.env.JEST_WORKER_ID));
             if (nodes.length > 0) candidates.push(...nodes);
-          } catch {}
+          } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         }
 
         // Narrow candidates to those within a reasonable ancestor (dropdown or listbox)
-        const inputRoot = el.closest('[role="combobox"], .react-select, .Select, .vs__dropdown, .multiselect__element, .ant-select') as Element | null;
+        const inputRoot = el.closest('[role="combobox"], .react-select, .Select, .vs__dropdown, .multiselect__element, .ant-select');
         let scoped: HTMLElement[] = [];
         if (inputRoot) {
           for (const c of candidates) {
             if (inputRoot.contains(c) || !!c.closest('.ant-select-dropdown') || !!c.closest('.Select__menu') || !!c.closest('.react-select__menu')) scoped.push(c);
           }
+          // Deliberately no fallback to the full unscoped `candidates` list here:
+          // we found a specific widget root, so if none of the rendered options
+          // belong to it, the visible ones almost certainly belong to a
+          // different open dropdown elsewhere on the page — better to skip
+          // than to risk clicking that unrelated widget's option.
+        } else {
+          // No widget root could be identified at all (e.g. options portalled
+          // directly under <body> with no recognizable wrapper class) — this
+          // is the genuine last-resort case where the full candidate list is
+          // the best information available.
+          scoped = candidates;
         }
-        if (scoped.length === 0) scoped = candidates;
 
         if (scoped.length > 0) {
           const lower = String(value ?? '').trim().toLowerCase();
-          let chosen = scoped.find((c) => (c.textContent ?? '').trim().toLowerCase() === lower) ?? scoped[0];
-          try { chosen.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
-          try { chosen.click(); } catch { try { chosen.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch {} }
+          const chosen = scoped.find((c) => (c.textContent ?? '').trim().toLowerCase() === lower) ?? scoped[0];
+          try { chosen.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+          try { chosen.click(); } catch { try { chosen.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           // If this input looks like a telephone field, sanitize chosen text to digits-only
           try {
             const isTel = (el instanceof HTMLInputElement && el.type === 'tel') || /phone|mobile|tel|contact/i.test((el.getAttribute && el.getAttribute('name') || '') + ' ' + (el.getAttribute && el.getAttribute('placeholder') || '') + ' ' + (el.id || ''));
             let chosenText = chosen.textContent?.trim() ?? '';
             if (isTel) chosenText = chosenText.replace(/\D/g, '');
-            try { nativeInputSetter?.call(el, chosenText); } catch {}
-            try { (el as HTMLInputElement).value = chosenText; } catch {}
+            try { nativeInputSetter?.call(el, chosenText); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+            try { (el as HTMLInputElement).value = chosenText; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
             this.dispatch(el, 'input', chosenText);
             this.dispatch(el, 'change');
             this.dispatch(el, 'blur');
             return true;
-          } catch {}
+          } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         }
       }
-    } catch {}
+    } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
     // --- Strategy 1: Native setter (required for React) ---
     // React intercepts the property setter on HTMLInputElement.prototype.value
@@ -370,9 +384,15 @@ export class FormFiller {
           // If the pattern explicitly includes separators (/, -, .), avoid treating
           // it as a plain integer-only field so formats like MM/YY or NNN-NN-NNNN
           // are preserved.
-          const patternHasSeparators = /[.,\-\/]/.test(patternAttr);
+          const patternHasSeparators = /[.,\-/]/.test(patternAttr);
           const patternHasLetters = /[A-Za-z]/.test(patternAttr);
-          const looksInteger = inputEl.type === 'tel' || inputMode === 'numeric' || ((integerHints.test(nameHint) && !expiryHints.test(nameHint) && !alphaIdHints.test(nameHint))) || (/\d/.test(patternAttr) && !patternHasSeparators && !expiryHints.test(patternAttr) && !patternHasLetters);
+          // A fractional `step` (e.g. step="0.5") means decimal values are
+          // explicitly valid for this field — don't let integerHints (which
+          // matches broad name substrings like "years"/"number"/"age") strip
+          // the decimal point and turn a valid "28.5" into an invalid "285".
+          const stepAttrForIntCheck = (inputEl.getAttribute && inputEl.getAttribute('step')) || '';
+          const stepIsFractional = stepAttrForIntCheck !== '' && stepAttrForIntCheck !== 'any' && (parseFloat(stepAttrForIntCheck) % 1 !== 0);
+          const looksInteger = !stepIsFractional && (inputEl.type === 'tel' || inputMode === 'numeric' || ((integerHints.test(nameHint) && !expiryHints.test(nameHint) && !alphaIdHints.test(nameHint))) || (/\d/.test(patternAttr) && !patternHasSeparators && !expiryHints.test(patternAttr) && !patternHasLetters));
           if (looksInteger) {
             finalValue = finalValue.replace(/\D/g, '');
           }
@@ -383,7 +403,7 @@ export class FormFiller {
               const digits = finalValue.replace(/\D/g, '');
               if (digits.length === 9) finalValue = `${digits.slice(0,3)}-${digits.slice(3,5)}-${digits.slice(5)}`;
             }
-          } catch {}
+          } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
           // Card expiry / expiry-like: prefer MM/YY formatting when possible
           try {
@@ -396,15 +416,15 @@ export class FormFiller {
                 if (m) finalValue = `${m[1]}/${m[2]}`;
               }
             }
-          } catch {}
+          } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
           // IFSC-like codes: uppercase, remove whitespace
           try {
             if (ifscHints.test(nameHint) || /ifsc/i.test(patternAttr)) {
               finalValue = finalValue.replace(/\s+/g, '').toUpperCase();
             }
-          } catch {}
-        } catch {}
+          } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       try {
         const maxAttr = (el.getAttribute && el.getAttribute('maxlength')) ? parseInt(el.getAttribute('maxlength') as string, 10) : null;
         const minAttr = (el.getAttribute && el.getAttribute('minlength')) ? parseInt(el.getAttribute('minlength') as string, 10) : null;
@@ -420,20 +440,33 @@ export class FormFiller {
         try {
           if (el instanceof HTMLInputElement) {
             const stepAttr = (el.getAttribute && el.getAttribute('step')) || null;
-            const isNumberLike = el.type === 'number' || /\bnumber\b|numeric|tel/.test((el.getAttribute && el.getAttribute('inputmode') || '') + ' ' + (el.type || ''));
+            // Deliberately excludes `tel` — phone numbers are digit strings,
+            // not numeric quantities, and can legitimately start with "0"
+            // (e.g. many international formats). Routing them through
+            // parseFloat/Number here silently drops that leading zero
+            // (parseFloat("0526234601") === 526234601), corrupting an
+            // otherwise-valid phone number by one digit.
+            const isNumberLike = el.type === 'number' || /\bnumber\b|numeric/.test((el.getAttribute && el.getAttribute('inputmode') || '') + ' ' + (el.type || ''));
             if (isNumberLike && stepAttr !== 'any') {
               const step = stepAttr ? parseFloat(stepAttr) : 1;
               const num = parseFloat(finalValue);
               if (!isNaN(num) && isFinite(num) && step > 0) {
                 const aligned = Math.round(num / step) * step;
-                // If step is an integer (>=1), write an integer string
-                if (step >= 1) finalValue = String(Math.round(aligned));
-                else finalValue = String(aligned);
+                if (step >= 1) {
+                  finalValue = String(Math.round(aligned));
+                } else {
+                  // Use toFixed (not String()) for fractional steps — plain
+                  // String() on a computed float like 45.67 can surface
+                  // binary floating-point noise (e.g. "45.66999999999999"),
+                  // which then fails the browser's own step-mismatch check.
+                  const decimals = stepAttr && stepAttr.includes('.') ? stepAttr.split('.')[1].length : 2;
+                  finalValue = aligned.toFixed(decimals);
+                }
               }
             }
           }
-        } catch {}
-      } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
         // Additional targeted normalizations:
         try {
@@ -462,7 +495,7 @@ export class FormFiller {
               finalValue = clamped.toFixed(6).replace(/\.0+$/, '').replace(/(\.[0-9]*?)0+$/, '$1');
             }
           }
-        } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
       el.value = finalValue;
     } catch { /* Some frameworks freeze the element */ }
@@ -481,17 +514,17 @@ export class FormFiller {
           const minAttr = (inputEl.getAttribute && inputEl.getAttribute('minlength')) ? parseInt(inputEl.getAttribute('minlength') as string, 10) : null;
           if (maxAttr && !isNaN(maxAttr) && v.length > maxAttr) v = v.slice(0, maxAttr);
           if (minAttr && !isNaN(minAttr) && v.length < minAttr) {
-            while (v.length < minAttr) v += String(Math.floor(Math.random() * 10));
+            while (v.length < minAttr) v += String(randomInt(0, 9));
           }
           nativeInputSetter?.call(el, v);
-          try { el.value = v; } catch {}
-        } catch {}
+          try { el.value = v; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       }
-    } catch {}
+    } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
     // Fire compositionend to flush any pending IME state (Vue 2 ignores
     // 'input' events while a composition is active).
-    try { el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: value })); } catch {}
+    try { el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: value })); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
     // Fire events in the order that most frameworks expect.
     // Include 'data' and 'inputType' on the InputEvent so frameworks that
@@ -514,7 +547,7 @@ export class FormFiller {
 
     el.focus();
     nativeInputSetter?.call(el, normalised);
-    try { el.value = normalised; } catch {}
+    try { el.value = normalised; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     this.dispatch(el, 'input', normalised);
     this.dispatch(el, 'change');
     this.dispatch(el, 'blur');
@@ -553,8 +586,8 @@ export class FormFiller {
     const tMatch = value.match(/T(\d{2}:\d{2})/);
     if (tMatch) return tMatch[1];
     // Generate a random business-hours time as fallback
-    const h = String(Math.floor(Math.random() * 11) + 8).padStart(2, '0');
-    const m = String(Math.floor(Math.random() * 60)).padStart(2, '0');
+    const h = String(randomInt(8, 18)).padStart(2, '0');
+    const m = String(randomInt(0, 59)).padStart(2, '0');
     return `${h}:${m}`;
   }
 
@@ -563,8 +596,8 @@ export class FormFiller {
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) return value;
     // If it's a date-only value, append a time
     if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-      const h = String(Math.floor(Math.random() * 11) + 8).padStart(2, '0');
-      const m = String(Math.floor(Math.random() * 60)).padStart(2, '0');
+      const h = String(randomInt(8, 18)).padStart(2, '0');
+      const m = String(randomInt(0, 59)).padStart(2, '0');
       return `${value}T${h}:${m}`;
     }
     // Try to parse as Date
@@ -574,7 +607,7 @@ export class FormFiller {
     }
     // Fallback: future date with time
     const now = new Date();
-    now.setDate(now.getDate() + Math.floor(Math.random() * 60) + 1);
+    now.setDate(now.getDate() + randomInt(0, 59) + 1);
     return now.toISOString().slice(0, 16);
   }
 
@@ -588,8 +621,8 @@ export class FormFiller {
     if (!isNaN(d.getTime())) return d.toISOString().slice(0, 7);
     // Fallback
     const now = new Date();
-    const year = now.getFullYear() + Math.floor(Math.random() * 2);
-    const month = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+    const year = now.getFullYear() + randomInt(0, 1);
+    const month = String(randomInt(1, 12)).padStart(2, '0');
     return `${year}-${month}`;
   }
 
@@ -613,8 +646,8 @@ export class FormFiller {
     }
     // Fallback
     const now = new Date();
-    const year = now.getFullYear() + Math.floor(Math.random() * 2);
-    const week = String(Math.floor(Math.random() * 52) + 1).padStart(2, '0');
+    const year = now.getFullYear() + randomInt(0, 1);
+    const week = String(randomInt(1, 52)).padStart(2, '0');
     return `${year}-W${week}`;
   }
 
@@ -622,9 +655,9 @@ export class FormFiller {
   // Select
   // -----------------------------------------------------------
 
-  private async fillSelect(el: any, value: string): Promise<boolean> {
+  private async fillSelect(el: HTMLElement, value: string): Promise<boolean> {
     // If this is a real <select> element, use native option handling
-    if (el && el.tagName && el.tagName.toLowerCase() === 'select') {
+    if (el.tagName.toLowerCase() === 'select') {
       const selectEl = el as HTMLSelectElement;
       let option = Array.from(selectEl.options).find(
         (o) => (o.value && o.value === value) || (o.text && o.text.trim().toLowerCase() === value.toLowerCase()),
@@ -633,20 +666,20 @@ export class FormFiller {
       if (!option) {
         const nonEmpty = Array.from(selectEl.options).filter((o) => (o.value ?? '').toString().trim() !== '');
         if (nonEmpty.length === 0) return false;
-        option = nonEmpty[Math.floor(Math.random() * nonEmpty.length)];
+        option = nonEmpty[randomInt(0, nonEmpty.length - 1)];
       }
 
       try {
         selectEl.focus();
         option.selected = true;
-        try { option.dispatchEvent(new Event('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] option click failed', e); } catch {} }
+        try { option.dispatchEvent(new Event('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] option click failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
         if (nativeSelectSetter) nativeSelectSetter.call(selectEl, option.value);
         // Direct assignment for Vue/Angular reactivity
-        try { selectEl.value = option.value; } catch {}
+        try { selectEl.value = option.value; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         this.dispatch(selectEl, 'input');
         this.dispatch(selectEl, 'change');
         this.dispatch(selectEl, 'blur');
-        try { console.debug('[FDF Pro] fillSelect (native):', this.cssSelector(selectEl), '=>', option.value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+        try { console.debug('[FDF Pro] fillSelect (native):', this.cssSelector(selectEl), '=>', option.value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
         return true;
       } catch {
         return false;
@@ -659,19 +692,19 @@ export class FormFiller {
 
     // If the selector points to an inner <input> of a custom widget (react-select, Select, etc.),
     // prefer the closest widget root so option queries find the menu items.
-    let root: Element = el as Element;
-    const wrapper = (el as Element).closest('.react-select, .Select, .vs__dropdown, .multiselect__element, .ant-select');
+    let root: Element = el;
+    const wrapper = el.closest('.react-select, .Select, .vs__dropdown, .multiselect__element, .ant-select');
     if (wrapper) root = wrapper;
 
     // Detect if this is a Vue Multiselect component
     const isMultiselect = !!root.querySelector('.multiselect__content, .multiselect__tags');
 
     // For Vue Multiselect, click the toggle/tags area to open the dropdown
-    const selectTrigger = root.querySelector('.multiselect__select, .multiselect__tags, .vs__dropdown-toggle') as HTMLElement | null;
+    const selectTrigger = root.querySelector<HTMLElement>('.multiselect__select, .multiselect__tags, .vs__dropdown-toggle');
       if (selectTrigger) {
-        try { selectTrigger.click(); } catch (e) { try { console.debug('[FDF Pro] trigger click failed', e); } catch {} }
+        try { selectTrigger.click(); } catch (e) { try { console.debug('[FDF Pro] trigger click failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       } else {
-        try { el.click(); } catch (e) { try { console.debug('[FDF Pro] element click failed', e); } catch {} }
+        try { el.click(); } catch (e) { try { console.debug('[FDF Pro] element click failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       }
 
       // Wait for Vue/React/Angular to process the dropdown opening
@@ -687,7 +720,7 @@ export class FormFiller {
           root.querySelectorAll<HTMLElement>('.multiselect__element'),
         ).filter((li) => {
           // Skip hidden placeholder items ("No elements found", "List is empty")
-          const s = (li as HTMLElement).style;
+          const s = (li).style;
           if (s && s.display === 'none') return false;
           // Skip items that don't have role="option"
           if (!li.getAttribute('role') && !li.querySelector('[role="option"]')) return false;
@@ -718,7 +751,7 @@ export class FormFiller {
         if (text && text === value.toLowerCase()) { chosen = c; break; }
       }
 
-      if (!chosen) chosen = optionCandidates[Math.floor(Math.random() * optionCandidates.length)];
+      if (!chosen) chosen = optionCandidates[randomInt(0, optionCandidates.length - 1)];
 
       // Prefer clicking the inner .multiselect__option span (Vue Multiselect
       // attaches its selection handler there, not on the outer <li>).
@@ -726,11 +759,11 @@ export class FormFiller {
       const innerOption = chosen.querySelector<HTMLElement>('.multiselect__option');
       if (innerOption) clickTarget = innerOption;
 
-      try { clickTarget.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+      try { clickTarget.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       // Use mousedown + click to support Vue Multiselect (uses @mousedown.prevent)
-      try { clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch {}
+      try { clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       try { clickTarget.click(); } catch {
-        try { clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] chosen click sequence failed', e); } catch {} }
+        try { clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] chosen click sequence failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       }
       // For Vue Multiselect, also try setting the internal hidden input value
       if (isMultiselect) {
@@ -739,16 +772,16 @@ export class FormFiller {
           const hiddenInput = root.querySelector<HTMLInputElement>('input[type="hidden"]');
           if (hiddenInput) {
             nativeInputSetter?.call(hiddenInput, chosenText);
-            try { hiddenInput.value = chosenText; } catch {}
+            try { hiddenInput.value = chosenText; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
             this.dispatch(hiddenInput, 'input');
             this.dispatch(hiddenInput, 'change');
           }
-        } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         // Also update the visible display text
         try {
           const display = root.querySelector<HTMLElement>('.multiselect__single');
           if (display) display.textContent = chosenText;
-        } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       }
 
       // If the original element was an inner input (e.g., react-select input),
@@ -756,19 +789,19 @@ export class FormFiller {
       try {
         const chosenText = (clickTarget.textContent ?? '').trim().replace(/\s+/g, ' ');
         if (el instanceof HTMLInputElement) {
-          try { nativeInputSetter?.call(el, chosenText); } catch {}
-          try { (el as HTMLInputElement).value = chosenText; } catch {}
+          try { nativeInputSetter?.call(el, chosenText); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+          try { (el).value = chosenText; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           this.dispatch(el, 'input', chosenText);
           this.dispatch(el, 'change');
           this.dispatch(el, 'blur');
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
       this.dispatch(root, 'input');
       this.dispatch(root, 'change');
       this.dispatch(root, 'blur');
 
-      try { console.debug('[FDF Pro] fillSelect (custom):', this.cssSelector(root), '=>', chosen?.textContent?.trim() ?? ''); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.debug('[FDF Pro] fillSelect (custom):', this.cssSelector(root), '=>', chosen?.textContent?.trim() ?? ''); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       return true;
     } catch {
       return false;
@@ -784,7 +817,7 @@ export class FormFiller {
     if (el.checked !== shouldCheck) {
       el.click(); // click() triggers all associated listeners
     }
-    try { console.debug('[FDF Pro] fillCheckbox:', this.cssSelector(el), '=>', shouldCheck); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+    try { console.debug('[FDF Pro] fillCheckbox:', this.cssSelector(el), '=>', shouldCheck); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
     return true;
   }
 
@@ -808,7 +841,7 @@ export class FormFiller {
         const nativeTarget = form.querySelector<HTMLInputElement>(sel);
         if (nativeTarget) {
           if (!nativeTarget.checked) nativeTarget.click();
-          try { console.debug('[FDF Pro] fillRadio (native):', this.cssSelector(nativeTarget), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+          try { console.debug('[FDF Pro] fillRadio (native):', this.cssSelector(nativeTarget), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           try {
             void sendMessageSafe({ action: 'REPORT_RADIO_DIAGNOSTIC', payload: {
               chosenSelector: this.cssSelector(nativeTarget),
@@ -817,7 +850,7 @@ export class FormFiller {
               chosenDataValue: nativeTarget.getAttribute('data-value') ?? null,
               kind: 'native', requestedValue: value, chosenIndex: null, candidatesCount: null, ts: new Date().toISOString(),
             } });
-          } catch (e) { try { console.debug('[FDF Pro] native radio handler error', e); } catch {} }
+          } catch (e) { try { console.debug('[FDF Pro] native radio handler error', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           return true;
         }
       }
@@ -838,7 +871,7 @@ export class FormFiller {
       const candidates: HTMLElement[] = Array.from(
         radioGroupScope.querySelectorAll<HTMLElement>('[role="radio"], [data-value], .radio, .option, label')
       ).filter((c) => c.offsetParent !== null);
-      try { console.debug('[FDF Pro] fillRadio scope:', isRadioGroup ? 'radiogroup-el' : (radioGroupScope === form ? 'form' : 'radiogroup'), '| candidates:', candidates.length); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.debug('[FDF Pro] fillRadio scope:', isRadioGroup ? 'radiogroup-el' : (radioGroupScope === form ? 'form' : 'radiogroup'), '| candidates:', candidates.length); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
 
       if (candidates.length > 0) {
         // Prefer aria-label or data-value, then visible text
@@ -877,19 +910,19 @@ export class FormFiller {
             for (let i = 0; i < lower.length; i++) h = (h * 31 + lower.charCodeAt(i)) >>> 0;
             const idx = len > 0 ? (h % len) : 0;
             idxChosen = idx;
-            chosen = candidates[idx] ?? candidates[Math.floor(Math.random() * candidates.length)];
-            try { console.debug('[FDF Pro] fillRadio (index-fallback):', { index: idx, total: candidates.length, chosen: this.cssSelector(chosen), value }); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+            chosen = candidates[idx] ?? candidates[randomInt(0, candidates.length - 1)];
+            try { console.debug('[FDF Pro] fillRadio (index-fallback):', { index: idx, total: candidates.length, chosen: this.cssSelector(chosen), value }); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           } catch (err) {
-            chosen = candidates[Math.floor(Math.random() * candidates.length)];
+            chosen = candidates[randomInt(0, candidates.length - 1)];
           }
         }
 
         if (chosen) {
-          try { chosen.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+          try { chosen.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           try { chosen.click(); } catch {
-            try { chosen.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] chosen click sequence failed', e); } catch {} }
+            try { chosen.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); chosen.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { try { console.debug('[FDF Pro] chosen click sequence failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           }
-          try { console.debug('[FDF Pro] fillRadio (custom):', this.cssSelector(chosen), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+          try { console.debug('[FDF Pro] fillRadio (custom):', this.cssSelector(chosen), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           try {
             void sendMessageSafe({ action: 'REPORT_RADIO_DIAGNOSTIC', payload: {
               chosenSelector: this.cssSelector(chosen),
@@ -898,16 +931,16 @@ export class FormFiller {
               chosenDataValue: chosen.getAttribute?.('data-value') ?? null,
               kind: 'custom', requestedValue: value, chosenIndex: idxChosen, candidatesCount: candidates.length, ts: new Date().toISOString(),
             } });
-          } catch (e) { try { console.debug('[FDF Pro] custom radio handler error', e); } catch {} }
+          } catch (e) { try { console.debug('[FDF Pro] custom radio handler error', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           return true;
         }
       }
-    } catch (e) { try { console.debug('[FDF Pro] fillRadio top-level error', e); } catch {} }
+    } catch (e) { try { console.debug('[FDF Pro] fillRadio top-level error', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
 
     // Fallback: if we still have the original input element, click it
     try {
       if (!(el as HTMLInputElement).checked) el.click();
-      try { console.debug('[FDF Pro] fillRadio (fallback):', this.cssSelector(el), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.debug('[FDF Pro] fillRadio (fallback):', this.cssSelector(el), '=>', value); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       try {
         void sendMessageSafe({ action: 'REPORT_RADIO_DIAGNOSTIC', payload: {
           chosenSelector: this.cssSelector(el),
@@ -916,7 +949,7 @@ export class FormFiller {
           chosenDataValue: (el as HTMLElement).getAttribute?.('data-value') ?? null,
           kind: 'fallback', requestedValue: value, chosenIndex: null, candidatesCount: null, ts: new Date().toISOString(),
         } });
-      } catch (e) { try { console.debug('[FDF Pro] radio fallback error', e); } catch {} }
+      } catch (e) { try { console.debug('[FDF Pro] radio fallback error', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       return true;
     } catch {
       return false;
@@ -972,7 +1005,8 @@ export class FormFiller {
           path.unshift(selector);
           break;
         } else {
-          const siblings = Array.from(node.parentElement?.children ?? []).filter((s) => s.tagName === node!.tagName);
+          const currentTag = node.tagName;
+          const siblings = Array.from(node.parentElement?.children ?? []).filter((s) => s.tagName === currentTag);
           if (siblings.length > 1) {
             const idx = siblings.indexOf(node) + 1;
             selector += `:nth-of-type(${idx})`;
@@ -1060,7 +1094,7 @@ export class FormFiller {
                   if (inputEl.value && typeof inputEl.validity !== 'undefined' && inputEl.validity.valid && !hasServerErrorClass) return;
                 }
               }
-            } catch (e) { try { console.debug('[FDF Pro] final catch suppressed', e); } catch {} }
+            } catch (e) { try { console.debug('[FDF Pro] final catch suppressed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
           }
 
           results.push({
@@ -1088,7 +1122,7 @@ export class FormFiller {
     for (const field of fields) {
       if (fieldsWithErrors.has(field.id)) continue; // Already have an error for this field
       try {
-        const el = scope.querySelector(field.selector) as HTMLElement | null;
+        const el = scope.querySelector(field.selector);
         if (!el) continue;
         const input = el as HTMLInputElement;
 
@@ -1125,7 +1159,7 @@ export class FormFiller {
             try {
               const errMsgEl = document.getElementById(errMsgId);
               if (errMsgEl) errorText = errMsgEl.textContent?.trim() ?? '';
-            } catch {}
+            } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           }
         }
 
@@ -1171,7 +1205,7 @@ export class FormFiller {
             nearFieldId: field.id,
           });
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     }
 
     return results;
@@ -1191,14 +1225,65 @@ export class FormFiller {
 
   async fillFormWithRecovery(
     formAnalysis: FormAnalysis,
-    options: { maxRetries?: number } = {},
+    options: { maxRetries?: number; signal?: AbortSignal } = {},
   ): Promise<{ filled: number; skipped: number; retries: number; finalErrors: string[] }> {
     const maxRetries = options.maxRetries ?? DEFAULT_SETTINGS.maxRetryAttempts ?? 3;
+    const signal = options.signal;
+    // Delay between field writes — use the configurable property (set to 0 in tests)
+    const interFieldDelay = this.interFieldDelayMs;
+    // Scope error queries to the form element for accuracy
+    const formScope = (() => { try { return document.querySelector(formAnalysis.selector) as Element ?? undefined; } catch { return undefined; } })();
+
+    // Snapshot initial DOM values BEFORE our fill so we can accurately count
+    // how many fields we actually changed (pre-existing values must not count).
+    const initialValues = new Map<string, string>();
+    try {
+      for (const f of formAnalysis.fields) {
+        try {
+          const el = this.resolveElement(f.selector) as HTMLInputElement | null;
+          if (!el) continue;
+          if (el.type === 'checkbox') {
+            initialValues.set(f.id, el.checked ? 'true' : '');
+          } else if (el.type === 'radio') {
+            initialValues.set(f.id, el.checked ? el.value : '');
+          } else {
+            initialValues.set(f.id, (el.value ?? '').toString());
+          }
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+      }
+    } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
     // Initial fill
     const initial = await this.fillForm(formAnalysis);
-    let filled = initial.filled;
     const { skipped } = initial;
+    // Build a set of field ids that were ACTUALLY changed by our fill
+    // (not just fields that already had a value before we started).
+    const filledSet = new Set<string>();
+    try {
+      for (const f of formAnalysis.fields) {
+        try {
+          const el = this.resolveElement(f.selector);
+          if (!el) continue;
+          const input = el as HTMLInputElement;
+          let currentValue = '';
+          if (input.type === 'checkbox') {
+            currentValue = input.checked ? 'true' : '';
+          } else if (input.type === 'radio') {
+            try {
+              const name = input.name;
+              if (name) {
+                const checked = document.querySelector<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(name)}"]:checked`);
+                currentValue = checked ? checked.value : '';
+              }
+            } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+          } else {
+            currentValue = (input.value ?? '').toString().trim();
+          }
+          const wasChanged = currentValue.length > 0 && currentValue !== (initialValues.get(f.id) ?? '').trim();
+          if (wasChanged) filledSet.add(f.id);
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+      }
+    } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     let retries = 0;
 
     // Track field ids that had errors in the previous iteration
@@ -1208,13 +1293,14 @@ export class FormFiller {
     const detectedErrorTypes = new Map<string, ErrorType>();
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
-      // Exponential backoff before each attempt to give validators time
-      const backoffMs = 200 * Math.pow(2, attempt);
+      if (signal?.aborted) break;
+      // Exponential backoff before each attempt to give validators time (capped at 2 s)
+      const backoffMs = Math.min(200 * Math.pow(2, attempt), 2000);
       await this.sleep(backoffMs);
 
-      const domErrors = this.scanDomErrors(formAnalysis.fields);
+      const domErrors = this.scanDomErrors(formAnalysis.fields, formScope);
       // Only consider field-associated errors for recovery (ignore page-level messages)
-      let fieldErrors = domErrors.filter((e) => e.fieldId && e.fieldId.length > 0);
+      const fieldErrors = domErrors.filter((e) => e.fieldId && e.fieldId.length > 0);
 
       // If selector-pass found unassociated errors, try to match them to fields
       // by scanning error text for field names/labels.
@@ -1238,7 +1324,7 @@ export class FormFiller {
         }
       }
 
-      try { console.info('[FDF] domErrors:', domErrors.length, '| fieldErrors:', fieldErrors.length, '| unassociated:', unassociated.length, fieldErrors.map(f => ({ id: f.fieldId, name: f.nearFieldName, text: f.text }))); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch {} }
+      try { console.info('[FDF] domErrors:', domErrors.length, '| fieldErrors:', fieldErrors.length, '| unassociated:', unassociated.length, fieldErrors.map(f => ({ id: f.fieldId, name: f.nearFieldName, text: f.text }))); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       if (fieldErrors.length === 0) break; // All field-level errors resolved
 
       // Detect stagnation: same fields and same count failing despite retries
@@ -1257,29 +1343,36 @@ export class FormFiller {
 
       // Ask background for recovery values (send only field-level errors)
       let recoveryFields: Array<{ field: string; value: string }> = [];
-      // Map of fieldId -> detected ErrorType returned by background
-      const detectedErrorTypes = new Map<string, ErrorType>();
+      // Reuse outer detectedErrorTypes map so detected types accumulate
+      // across attempts instead of being shadowed by a per-iteration map.
       try {
         console.info('[FDF] requesting recovery for detected errors', fieldErrors.map(d => d.selector));
-        const response = await sendMessageSafe({
+        const response = await sendMessageSafe<ExtensionMessage, ExtensionResponse<DetectErrorsResult>>({
           action: 'DETECT_ERRORS',
           payload: {
             errorElements: fieldErrors.map((e) => {
-              let elementHtml: string | null = null;
+              let elementText: string | null = null;
+              let elementId: string | null = null;
+              let elementClass: string | null = null;
               try {
                 const el = document.querySelector(e.selector);
-                elementHtml = el ? (el as HTMLElement).outerHTML : null;
-              } catch {}
+                if (el) {
+                  elementText = el.textContent?.trim() ?? null;
+                  elementId = el.id || null;
+                  elementClass = el.className?.toString() ?? null;
+                }
+              } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               return {
                 selector: e.selector,
                 text: e.text,
                 nearFieldName: e.nearFieldName,
-                nearFieldId: (e as any).nearFieldId,
-                elementHtml,
+                nearFieldId: e.nearFieldId,
+                elementText,
+                elementId,
+                elementClass,
               };
             }),
             fields: formAnalysis.fields,
-            consoleLogs: (window as any).__fdf_console_capture?.entries ?? [],
           },
         });
 
@@ -1295,7 +1388,7 @@ export class FormFiller {
               if (m && m.fieldName) {
                 // fieldName may be a name/label; try to resolve to field id
                 const fld = formAnalysis.fields.find((f) => f.name === m.fieldName || f.label === m.fieldName || f.id === m.fieldName);
-                if (fld) detectedErrorTypes.set(fld.id, m.type as ErrorType);
+                if (fld) detectedErrorTypes.set(fld.id, m.type);
               }
             }
           }
@@ -1349,7 +1442,7 @@ export class FormFiller {
                   // This addresses messages like "Please match the requested format."
                   // --------------------------------------------------
                   try {
-                    const inputEl = el as HTMLInputElement;
+                    const inputEl = el;
                     const looksLikePatternError = /please match the requested format|format/i.test(errText) || (inputEl.validity && (inputEl.validity.patternMismatch || inputEl.validity.typeMismatch));
                     if (looksLikePatternError) {
                       const rawPattern = fld.constraints?.pattern || (inputEl.getAttribute && inputEl.getAttribute('pattern')) || '';
@@ -1362,11 +1455,11 @@ export class FormFiller {
                         const repeatMatch = rawPattern.match(/\\d\{(\d+)\}/) || rawPattern.match(/\[0-9\]\{(\d+)\}/);
                         if (repeatMatch) {
                           const n = parseInt(repeatMatch[1], 10) || 6;
-                          candidate = Array.from({ length: n }, () => String(Math.floor(Math.random() * 10))).join('');
+                          candidate = Array.from({ length: n }, () => String(randomInt(0, 9))).join('');
                         } else if (/\\d\+/.test(rawPattern) || /\[0-9\]\+/.test(rawPattern) || /\d\*/.test(rawPattern)) {
-                          candidate = Array.from({ length: 10 }, () => String(Math.floor(Math.random() * 10))).join('');
+                          candidate = Array.from({ length: 10 }, () => String(randomInt(0, 9))).join('');
                         } else if (/email|e-?mail/i.test(inputEl.type || '') || /@/.test(rawPattern)) {
-                          candidate = `user${Math.floor(Math.random() * 10000)}@example.test`;
+                          candidate = `user${randomInt(0, 9999)}@example.test`;
                         } else if (/iso|yyyy|mm|dd|date/i.test(rawPattern) || inputEl.type === 'date') {
                           const d = new Date(); d.setDate(d.getDate() + 7);
                           candidate = d.toISOString().slice(0, 10);
@@ -1376,15 +1469,15 @@ export class FormFiller {
                             const digits = (cur || '').replace(/\D/g, '').slice(-10) || '5551234567';
                             candidate = digits;
                           } else if (inputEl.type === 'email') {
-                            candidate = `user${Math.floor(Math.random() * 10000)}@example.test`;
+                            candidate = `user${randomInt(0, 9999)}@example.test`;
                           } else {
                             candidate = String(fld.value ?? cur ?? '').slice(0, 64) || '';
                           }
                         }
                       } else {
                         // No explicit pattern: try simple type-based fixes
-                        if ((el as HTMLInputElement).type === 'tel') candidate = ((cur || '').replace(/\D/g, '').slice(-10) || '5551234567');
-                        else if ((el as HTMLInputElement).type === 'email') candidate = `user${Math.floor(Math.random() * 10000)}@example.test`;
+                        if ((el).type === 'tel') candidate = ((cur || '').replace(/\D/g, '').slice(-10) || '5551234567');
+                        else if ((el).type === 'email') candidate = `user${randomInt(0, 9999)}@example.test`;
                         else candidate = String(fld.value ?? cur ?? '');
                       }
 
@@ -1393,7 +1486,7 @@ export class FormFiller {
                         continue;
                       }
                     }
-                  } catch {}
+                  } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
                 } catch {
                   if (candidates[0] !== cur) localFixes.push({ id: fld.id, value: candidates[0] });
                 }
@@ -1434,8 +1527,17 @@ export class FormFiller {
               const base = cur.replace(/\d+$/, '');
               localFixes.push({ id: fld.id, value: `${base}${Date.now() % 10000}` });
             } else {
-              // Strip disallowed characters
-              const cleaned = cur.replace(/[^A-Za-z0-9._-]/g, '');
+              // Strip characters the field doesn't allow. Prefer the field's
+              // own `pattern` character class when it's a simple one (e.g.
+              // "^[a-zA-Z0-9_]{3,20}$") — a generic "username-safe" charset
+              // like [A-Za-z0-9._-] can still violate a stricter pattern
+              // that (for example) allows underscores but not dots/hyphens.
+              let allowedCharsRe = /[^A-Za-z0-9._-]/g;
+              try {
+                const patternCharClass = fld.constraints?.pattern?.match(/^\^?\[([^\]]+)\]/)?.[1];
+                if (patternCharClass) allowedCharsRe = new RegExp(`[^${patternCharClass}]`, 'g');
+              } catch (e) { logSwallowed('src/content/form-filler.ts:username-pattern', e); }
+              const cleaned = cur.replace(allowedCharsRe, '');
               if (cleaned !== cur && cleaned.length > 0) {
                 localFixes.push({ id: fld.id, value: cleaned });
               }
@@ -1498,7 +1600,7 @@ export class FormFiller {
           if (fld.type === 'creditCardCvv' || /cvv|cvc|security.?code/i.test(fldHint)) {
             const digits = cur.replace(/\D/g, '').slice(0, 4);
             if (digits.length < 3) {
-              localFixes.push({ id: fld.id, value: String(Math.floor(Math.random() * 900) + 100) });
+              localFixes.push({ id: fld.id, value: String(randomInt(100, 999)) });
             } else if (digits !== cur) {
               localFixes.push({ id: fld.id, value: digits });
             }
@@ -1568,12 +1670,13 @@ export class FormFiller {
               || el.type === 'number' || el.type === 'range'
               || /digits only|numbers only|numeric only|must be a number|not a.*number|enter a.*number|must be numeric/i.test(errText)) {
             // Strip non-numeric characters (keep decimal point and minus)
-            let numeric = cur.replace(/[^0-9.\-]/g, '');
+            let numeric = cur.replace(/[^0-9.-]/g, '');
+            const minVal = fld.constraints?.min != null ? Number(fld.constraints.min) : 1;
+            const maxVal = fld.constraints?.max != null ? Number(fld.constraints.max) : 100;
+            const stepVal = fld.constraints?.step != null ? Number(fld.constraints.step) : null;
             if (numeric === '' || isNaN(Number(numeric))) {
               // Generate a fresh number within constraints
-              const minVal = fld.constraints?.min != null ? Number(fld.constraints.min) : 1;
-              const maxVal = fld.constraints?.max != null ? Number(fld.constraints.max) : 100;
-              numeric = String(Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal);
+              numeric = generateStepAlignedNumber(minVal, maxVal, stepVal);
             } else {
               // Clamp to min/max
               let num = Number(numeric);
@@ -1588,7 +1691,12 @@ export class FormFiller {
                 const maxHint = errText.match(/(\d+)/);
                 if (maxHint) num = Math.min(num, parseInt(maxHint[1], 10));
               }
-              numeric = String(num);
+              // A "constraints not satisfied" style error can also mean the
+              // value is off-step (e.g. step="0.5") even though it's within
+              // range — snap it to the nearest valid step multiple too.
+              numeric = stepVal && stepVal > 0 && !isNaN(stepVal)
+                ? generateStepAlignedNumber(minVal, maxVal, stepVal, num)
+                : String(num);
             }
             if (numeric !== cur) localFixes.push({ id: fld.id, value: numeric });
             continue;
@@ -1609,9 +1717,9 @@ export class FormFiller {
               const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
               const maxLen = fld.constraints?.maxLength ?? 8;
               const prefixLen = Math.min(2, Math.max(1, maxLen - 2));
-              const prefix = Array.from({ length: prefixLen }, () => letters[Math.floor(Math.random() * 26)]).join('');
+              const prefix = Array.from({ length: prefixLen }, () => letters[randomInt(0, 25)]).join('');
               const digitLen = Math.max(1, Math.min(6, maxLen - prefixLen));
-              const num = String(Math.floor(Math.random() * Math.pow(10, digitLen))).padStart(digitLen, '0');
+              const num = String(randomInt(0, Math.pow(10, digitLen) - 1)).padStart(digitLen, '0');
               localFixes.push({ id: fld.id, value: `${prefix}${num}` });
             }
             continue;
@@ -1714,18 +1822,17 @@ export class FormFiller {
 
         if (localFixes.length > 0) {
           retries++;
-          const interFieldDelay = (typeof process !== 'undefined' && (process.env.JEST_WORKER_ID || process.env.NODE_ENV === 'test')) ? 0 : 30;
           for (const fix of localFixes) {
             const fld = formAnalysis.fields.find((f) => f.id === fix.id);
             if (!fld) continue;
             const el = this.resolveElement(fld.selector);
             if (!el) continue;
             const success = await this.fillField(el, { ...fld, value: fix.value });
-            if (success) filled++;
+            if (success) filledSet.add(fld.id);
             await this.sleep(interFieldDelay);
           }
           // continue to next attempt to let validators run
-          try { console.info('[FDF] applied local fixes:', localFixes.map(l => ({ id: l.id, value: l.value }))); } catch {}
+          try { console.info('[FDF] applied local fixes:', localFixes.map(l => ({ id: l.id, value: l.value }))); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           continue;
         }
 
@@ -1765,19 +1872,18 @@ export class FormFiller {
         }
 
         const success = await this.fillField(el, { ...fieldAnalysis, value: newValue });
-        if (success) filled++;
-        const interFieldDelay = (typeof process !== 'undefined' && (process.env.JEST_WORKER_ID || process.env.NODE_ENV === 'test')) ? 0 : 30;
+        if (success) filledSet.add(fieldAnalysis.id);
         await this.sleep(interFieldDelay);
       }
       try {
-        const after = this.scanDomErrors(formAnalysis.fields).filter((e) => e.fieldId && e.fieldId.length > 0);
+        const after = this.scanDomErrors(formAnalysis.fields, formScope).filter((e) => e.fieldId && e.fieldId.length > 0);
         console.info('[FDF] post-recovery remaining:', after.map(a => ({ id: a.fieldId, text: a.text, name: a.nearFieldName })));
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     }
 
     // After recovery loop, report newly-clean fields to background learning DB
     if (retries > 0) {
-      const remainingErrors = this.scanDomErrors(formAnalysis.fields);
+      const remainingErrors = this.scanDomErrors(formAnalysis.fields, formScope);
       const stillErrIds = new Set(remainingErrors.map((e) => e.fieldId));
       for (const field of formAnalysis.fields) {
         if (
@@ -1822,23 +1928,23 @@ export class FormFiller {
             const needsWrite = !/^\d{4}-\d{2}-\d{2}$/.test(cur);
             if (needsWrite) {
               if (fldVal) {
-                try { this.fillDateInput(el, String(fldVal)); } catch {}
+                try { this.fillDateInput(el, String(fldVal)); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               } else {
                 // Fallback: synthesise a reasonable future date to satisfy validators
                 try {
                   const d = new Date();
                   d.setFullYear(d.getFullYear() + 1);
                   const synthesized = d.toISOString().slice(0, 10);
-                  try { nativeInputSetter?.call(el, synthesized); } catch {}
-                  try { el.value = synthesized; } catch {}
+                  try { nativeInputSetter?.call(el, synthesized); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+                  try { el.value = synthesized; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
                   this.dispatch(el, 'input', synthesized);
                   this.dispatch(el, 'change');
                   this.dispatch(el, 'blur');
-                } catch {}
+                } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               }
             }
           }
-        } catch {}
+        } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
         // Re-read raw after attempted write
         const rawAfter = (el.value ?? '').toString();
         if (!rawAfter) continue;
@@ -1850,8 +1956,8 @@ export class FormFiller {
           if (digits.length === 9) {
             const formatted = `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5, 9)}`;
             if (formatted !== raw) {
-              try { nativeInputSetter?.call(el, formatted); } catch {}
-              try { el.value = formatted; } catch {}
+              try { nativeInputSetter?.call(el, formatted); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+              try { el.value = formatted; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               this.dispatch(el, 'input', formatted);
               this.dispatch(el, 'change');
               this.dispatch(el, 'blur');
@@ -1867,37 +1973,37 @@ export class FormFiller {
             const yy = digits.slice(2, 4);
             const formatted = `${mm}/${yy}`;
             if (formatted !== raw) {
-              try { nativeInputSetter?.call(el, formatted); } catch {}
-              try { el.value = formatted; } catch {}
+              try { nativeInputSetter?.call(el, formatted); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
+              try { el.value = formatted; } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
               this.dispatch(el, 'input', formatted);
               this.dispatch(el, 'change');
               this.dispatch(el, 'blur');
             }
           }
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     }
 
-    const finalErrors = this.scanDomErrors(formAnalysis.fields)
+    const finalErrors = this.scanDomErrors(formAnalysis.fields, formScope)
       .filter((e) => e.fieldId && e.fieldId.length > 0)
       .map((e) => e.text);
-    // debug logs removed
     // If auto-retries exhausted and there are still errors, focus first failing field
     if (finalErrors.length > 0) {
       try {
-        const remaining = this.scanDomErrors(formAnalysis.fields);
+        const remaining = this.scanDomErrors(formAnalysis.fields, formScope);
         if (remaining.length > 0) {
           const first = remaining[0];
           const fld = formAnalysis.fields.find((f) => f.id === first.fieldId);
           if (fld) {
             const el = this.resolveElement(fld.selector);
             if (el) {
-              try { (el).focus(); } catch {}
+              try { (el).focus(); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
             }
           }
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     }
+    const filled = filledSet.size;
     return { filled, skipped, retries, finalErrors };
   }
 
@@ -2015,7 +2121,7 @@ export class FormFiller {
             if (match) return match;
           }
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
       node = node.parentElement;
       depth++;
     }
@@ -2053,7 +2159,7 @@ export class FormFiller {
         const cs = window.getComputedStyle(htmlEl);
         if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
       }
-    } catch {}
+    } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
 
     // 3. Look for a form-group-like ancestor container
     const container = el.closest(
@@ -2074,7 +2180,7 @@ export class FormFiller {
       // rather than on the container.
       const nearestInput = container.querySelector(
         'input, textarea, select',
-      ) as HTMLElement | null;
+      );
       if (nearestInput) {
         if (
           nearestInput.classList?.contains('is-invalid') ||
@@ -2122,4 +2228,29 @@ export class FormFiller {
       .join('');
     return cls ? `${tag}${cls}` : tag;
   }
+}
+
+/**
+ * Generate (or snap an existing value to) a step-aligned number within
+ * [min, max]. Mirrors the step-awareness in background/data-generator.ts's
+ * generateNumber() — without this, a recovery fix can pick a value that's
+ * in-range but still fails an HTML5 `step` constraint (e.g. step="0.5"),
+ * leaving the field stuck failing "Constraints not satisfied" every retry.
+ */
+function generateStepAlignedNumber(min: number, max: number, step: number | null, near?: number): string {
+  if (isNaN(min) || isNaN(max) || min > max) return String(near ?? min);
+  if (!step || step <= 0 || isNaN(step)) {
+    return String(near ?? randomInt(min, max));
+  }
+  const steps = Math.floor((max - min) / step);
+  if (steps <= 0) return String(min);
+  const stepIndex = near != null
+    ? Math.min(Math.max(Math.round((near - min) / step), 0), steps)
+    : randomInt(0, steps);
+  const value = min + stepIndex * step;
+  if (step % 1 !== 0) {
+    const decimals = String(step).split('.')[1]?.length ?? 2;
+    return value.toFixed(decimals);
+  }
+  return String(value);
 }

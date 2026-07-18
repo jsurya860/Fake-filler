@@ -6,6 +6,7 @@ import { ProfileSelector } from './components/ProfileSelector';
 import { SettingsPanel } from './components/SettingsPanel';
 import { StatusBadge } from './components/StatusBadge';
 import { DebugPanel } from './components/DebugPanel';
+import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // Error Boundary
@@ -86,13 +87,13 @@ function AppContent(): JSX.Element {
         try {
           const d = await sendToBackground<RadioDiagnostic>({ action: 'GET_RADIO_DIAGNOSTIC' });
           if (d.success) setRadioDiag(d.data ?? null);
-        } catch {}
+        } catch (e) { logSwallowed('src/popup/App.tsx', e); }
         // fetch chain log
         try {
           const logResp = await sendToBackground<Array<{ step: number; url: string; fieldsCount: number; ts: number }>>({ action: 'GET_CHAIN_LOG' });
           if (logResp.success && logResp.data) setChainLog(logResp.data);
-        } catch {}
-      } catch {}
+        } catch (e) { logSwallowed('src/popup/App.tsx', e); }
+      } catch (e) { logSwallowed('src/popup/App.tsx', e); }
     }
     // Initial refresh + interval
     void refresh();
@@ -129,7 +130,7 @@ function AppContent(): JSX.Element {
         if (chainResp.success && chainResp.data) {
           setChainingState({ active: !!chainResp.data.active, fillCount: chainResp.data.fillCount ?? 0 });
         }
-      } catch {}
+      } catch (e) { logSwallowed('src/popup/App.tsx', e); }
 
       if (!formsResp.success || !formsResp.data?.length) {
         setStatus('no-form');
@@ -226,8 +227,8 @@ function AppContent(): JSX.Element {
       if (!resp.success) throw new Error(resp.error ?? 'Fill failed.');
       // Content script may return success:true but with skipped:true when
       // a modal overlay blocked the fill — treat as a warning, not success.
-      if (resp.data && (resp.data as any).skipped === true) {
-        const reason = (resp.data as any).reason ?? 'Fill was skipped';
+      if (resp.data && resp.data.skipped === true) {
+        const reason = typeof resp.data.reason === 'string' ? resp.data.reason : 'Fill was skipped';
         throw new Error(`Fill skipped: ${reason}. Close any open overlays and try again.`);
       }
       setStatus('success');
@@ -299,11 +300,13 @@ function AppContent(): JSX.Element {
             <button
               className="btn btn--link"
               title="Stop chaining"
-              onClick={async () => {
-                try {
-                  await sendToBackground({ action: 'DISABLE_CHAINING' });
-                  setChainingState({ active: false, fillCount: 0 });
-                } catch {}
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await sendToBackground({ action: 'DISABLE_CHAINING' });
+                    setChainingState({ active: false, fillCount: 0 });
+                  } catch (e) { logSwallowed('src/popup/App.tsx', e); }
+                })();
               }}
             >
               ⛔ Stop chaining
@@ -355,14 +358,14 @@ function AppContent(): JSX.Element {
               try {
                 await sendToBackground({ action: 'START_CHAINING' });
                 setChainingState({ active: true, fillCount: 0 });
-              } catch {}
+              } catch (e) { logSwallowed('src/popup/App.tsx', e); }
             }}
             onStopChaining={async () => {
               try {
                 await sendToBackground({ action: 'DISABLE_CHAINING' });
                 setChainingState({ active: false, fillCount: 0 });
                 setChainLog([]);
-              } catch {}
+              } catch (e) { logSwallowed('src/popup/App.tsx', e); }
             }}
             chainLog={chainLog}
           />
@@ -511,7 +514,7 @@ function FillTab({
         />
       ) : (
         <div className="preview-placeholder">
-          <p>Click "Generate" to preview data before filling.</p>
+          <p>Click &ldquo;Generate&rdquo; to preview data before filling.</p>
         </div>
       )}
 
@@ -526,7 +529,7 @@ function FillTab({
       <div className="action-row">
         <button
           className="btn btn--secondary"
-          onClick={onGenerate}
+          onClick={() => void onGenerate()}
           disabled={busy}
           title="Generate new fake data"
         >
@@ -534,7 +537,7 @@ function FillTab({
         </button>
         <button
           className="btn btn--primary"
-          onClick={onFill}
+          onClick={() => void onFill()}
           disabled={busy}
           title="Fill the form with the generated data"
         >
@@ -547,7 +550,7 @@ function FillTab({
         {!chainingState.active ? (
           <button
             className="btn btn--secondary"
-            onClick={onStartChaining}
+            onClick={() => void onStartChaining()}
             disabled={busy}
             title="Fill this form, then auto-fill subsequent pages/steps"
           >
@@ -556,7 +559,7 @@ function FillTab({
         ) : (
           <button
             className="btn btn--secondary"
-            onClick={onStopChaining}
+            onClick={() => void onStopChaining()}
             title="Stop auto-filling new forms"
             style={{ color: '#e53e3e' }}
           >
