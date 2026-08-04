@@ -1,3 +1,4 @@
+import browser from 'webextension-polyfill';
 import type {
   ExtensionMessage,
   ExtensionResponse,
@@ -223,8 +224,8 @@ import type { ApiErrorEntry } from './api-interceptor';
     });
 
     // Watch for settings changes in storage so hotkey updates without reload
-    if (chrome.storage && chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 'function') {
-      chrome.storage.onChanged.addListener((changes) => {
+    if (browser.storage && browser.storage.onChanged && typeof browser.storage.onChanged.addListener === 'function') {
+      browser.storage.onChanged.addListener((changes) => {
         if (changes.settings) {
           try {
             const newSettings = changes.settings.newValue as { oneClickHotkey?: string; domainBlacklist?: string[] } | undefined;
@@ -574,24 +575,17 @@ function showTransientToast(message: string, ms = 2200): void {
 async function saveLastGeneratedPayment(generated: FormAnalysis, src?: string | undefined): Promise<void> {
   try {
     const payload = { ts: Date.now(), generated, src };
-    if (chrome?.storage?.local && typeof chrome.storage.local.set === 'function') {
-      await chrome.storage.local.set({ fdf_last_generated_payment: payload });
+    if (browser?.storage?.local && typeof browser.storage.local.set === 'function') {
+      await browser.storage.local.set({ fdf_last_generated_payment: payload });
     }
   } catch (e) { logSwallowed('src/content/index.ts', e); }
 }
 
 async function getLastGeneratedPayment(): Promise<{ ts: number; generated: FormAnalysis; src?: string } | null> {
   try {
-    if (chrome?.storage?.local && typeof chrome.storage.local.get === 'function') {
-      return await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get('fdf_last_generated_payment', (v: Record<string, unknown>) => {
-            try { resolve((v.fdf_last_generated_payment as { ts: number; generated: FormAnalysis; src?: string } | undefined) ?? null); } catch { resolve(null); }
-          });
-        } catch {
-          resolve(null);
-        }
-      });
+    if (browser?.storage?.local && typeof browser.storage.local.get === 'function') {
+      const v = await browser.storage.local.get('fdf_last_generated_payment');
+      return (v.fdf_last_generated_payment as { ts: number; generated: FormAnalysis; src?: string } | undefined) ?? null;
     }
   } catch (e) { logSwallowed('src/content/index.ts', e); }
   return null;
@@ -969,34 +963,19 @@ function cssSelectorInDocument(el: Element, doc: Document): string {
 // -----------------------------------------------------------
 
 try {
-  chrome.runtime.onMessage.addListener(
-    (
-      message: ExtensionMessage,
-      _sender: chrome.runtime.MessageSender,
-      sendResponse: (response: ExtensionResponse) => void,
-    ) => {
-      handleMessage(message, sendResponse);
-      return true; // keep async channel open
-    },
-  );
-} catch {
-  // Extension context already invalidated — content script will
-  // continue running but cannot communicate with the background.
-}
-
-function handleMessage(
-  message: ExtensionMessage,
-  sendResponse: (response: ExtensionResponse) => void,
-): void {
-  void (async () => {
+  browser.runtime.onMessage.addListener(async (rawMessage: unknown): Promise<ExtensionResponse> => {
+    const message = rawMessage as ExtensionMessage;
     try {
       console.debug('[FDF Pro] content script received message', message.action);
       const data = await dispatch(message);
-      sendResponse({ success: true, data });
+      return { success: true, data };
     } catch (err) {
-      sendResponse({ success: false, error: (err as Error).message });
+      return { success: false, error: (err as Error).message };
     }
-  })();
+  });
+} catch {
+  // Extension context already invalidated — content script will
+  // continue running but cannot communicate with the background.
 }
 
 async function dispatch(message: ExtensionMessage): Promise<unknown> {

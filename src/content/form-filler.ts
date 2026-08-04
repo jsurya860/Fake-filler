@@ -440,13 +440,17 @@ export class FormFiller {
         try {
           if (el instanceof HTMLInputElement) {
             const stepAttr = (el.getAttribute && el.getAttribute('step')) || null;
-            // Deliberately excludes `tel` — phone numbers are digit strings,
-            // not numeric quantities, and can legitimately start with "0"
-            // (e.g. many international formats). Routing them through
-            // parseFloat/Number here silently drops that leading zero
-            // (parseFloat("0526234601") === 526234601), corrupting an
-            // otherwise-valid phone number by one digit.
-            const isNumberLike = el.type === 'number' || /\bnumber\b|numeric/.test((el.getAttribute && el.getAttribute('inputmode') || '') + ' ' + (el.type || ''));
+            // Deliberately excludes `tel`, and any zip/postal/ssn/account/
+            // routing-style identifier field — these are digit STRINGS, not
+            // numeric quantities, and can legitimately start with (or contain
+            // runs of) "0" (e.g. ZIP "00501", account "0012345"). Routing
+            // them through parseFloat/Number here silently drops leading
+            // zeros (parseFloat("00034") === 34), corrupting an otherwise
+            // valid value down to a fraction of its digits.
+            const idStringHints = /postal|zip|zipcode|ssn|routing|routingnumber|bankaccount|accountnumber|phone|mobile|tel|contact/i;
+            const nameHintForStep = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('placeholder') || '')).toLowerCase();
+            const isIdString = el.type === 'tel' || idStringHints.test(nameHintForStep);
+            const isNumberLike = !isIdString && (el.type === 'number' || /\bnumber\b|numeric/.test((el.getAttribute && el.getAttribute('inputmode') || '') + ' ' + (el.type || '')));
             if (isNumberLike && stepAttr !== 'any') {
               const step = stepAttr ? parseFloat(stepAttr) : 1;
               const num = parseFloat(finalValue);
@@ -1072,9 +1076,17 @@ export class FormFiller {
 
           const nearField = this.findNearestField(errorEl, fields);
 
-          // If the matched field's container has .success OR the input
-          // passes HTML5 validity, the field is valid — skip this error
-          // so the field never enters the recovery loop.
+          // If the matched field's container is explicitly marked .success,
+          // trust that positive signal and skip this error. We deliberately
+          // do NOT also veto based on native HTML5 constraint validity here:
+          // isErrorElementActive() above already confirmed this error text is
+          // actually visible/live, and most custom (JS-driven) validators —
+          // which is how the overwhelming majority of real sites validate
+          // things like ZIP codes — never touch the input's HTML5 constraint
+          // attributes at all, so `validity.valid` is trivially true
+          // regardless of whether the value is actually accepted. Trusting
+          // validity here would silently discard exactly the errors this
+          // scanner exists to catch.
           if (nearField) {
             try {
               const matchedField = fields.find((f) => f.id === nearField.id);
@@ -1083,15 +1095,6 @@ export class FormFiller {
                 if (fieldEl) {
                   const container = fieldEl.closest('.form-group, .form-field, .field-group');
                   if (container && container.classList.contains('success')) return;
-                  // Browser says the value is valid — trust it over stale DOM error text
-                  // BUT: if the input itself has a server-side error class (e.g.
-                  // 'error-input'), the server rejected it despite HTML5 validity.
-                  const inputEl = fieldEl as HTMLInputElement;
-                  const hasServerErrorClass = inputEl.classList?.contains('error-input')
-                    || inputEl.classList?.contains('is-invalid')
-                    || inputEl.classList?.contains('has-error')
-                    || inputEl.getAttribute('aria-invalid') === 'true';
-                  if (inputEl.value && typeof inputEl.validity !== 'undefined' && inputEl.validity.valid && !hasServerErrorClass) return;
                 }
               }
             } catch (e) { try { console.debug('[FDF Pro] final catch suppressed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
@@ -1398,10 +1401,18 @@ export class FormFiller {
         recoveryFields = [];
       }
 
-      // If background provided no suggestions, try small local reformat/cleanup heuristics
-      if (recoveryFields.length === 0) {
+      // Try local reformat/cleanup heuristics for any field the background
+      // did NOT resolve this round — even when it DID resolve others. Gating
+      // this on "background resolved nothing at all" would mean one easy
+      // background fix (e.g. a ZIP code) silently starves every other
+      // erroring field of the local-fix pass, and some error types (e.g.
+      // 'pattern') are only ever resolved by these local heuristics — the
+      // background's own strategy for them explicitly defers here.
+      const resolvedFieldIds = new Set(recoveryFields.map((u) => u.field));
+      const unresolvedErrors = fieldErrors.filter((e) => !e.fieldId || !resolvedFieldIds.has(e.fieldId));
+      if (unresolvedErrors.length > 0) {
         const localFixes: Array<{ id: string; value: string }> = [];
-        for (const err of fieldErrors) {
+        for (const err of unresolvedErrors) {
           const fld = formAnalysis.fields.find((f) => f.id === err.fieldId);
           if (!fld) continue;
           const el = this.resolveElement(fld.selector) as HTMLInputElement | null;
@@ -1655,8 +1666,13 @@ export class FormFiller {
           // --------------------------------------------------
           if (fld.type === 'zipcode' || /zip|postal/i.test(fldHint)) {
             const digits = cur.replace(/\D/g, '');
-            const targetLen = fld.constraints?.maxLength ?? 5;
-            const fixed = digits.slice(0, targetLen).padEnd(Math.min(targetLen, 5), '0');
+            // The error message itself is authoritative when it states an
+            // explicit length (e.g. "Enter 5 digit zip code") — prefer that
+            // over the DOM's maxLength, which may be absent, overly
+            // generous (e.g. allowing ZIP+4), or simply wrong.
+            const msgLenMatch = errText.match(/(\d+)\s*-?\s*digit/i);
+            const targetLen = msgLenMatch ? parseInt(msgLenMatch[1], 10) : (fld.constraints?.maxLength ?? 5);
+            const fixed = digits.slice(0, targetLen).padEnd(targetLen, '0');
             if (fixed !== cur && fixed.length >= 3) {
               localFixes.push({ id: fld.id, value: fixed });
             }
@@ -1710,6 +1726,18 @@ export class FormFiller {
           const isAlphanumericError = /only contain letters and numbers|only.*alphanumeric|must be alphanumeric|letters.*numbers only|alphanumeric only/i.test(errText);
           const isCodeLabel = /\bcode\b/i.test(fldHint) && !/postal|zip|pin|area/i.test(fldHint);
           if (isAlphanumericError || isCodeLabel) {
+            // The message stating an explicit purely-numeric length (e.g.
+            // "Enter 5 digit code") is authoritative over the generic
+            // letter+digit varchar we'd otherwise default "code"-labeled
+            // fields to — a field named "code" doesn't mean its expected
+            // value contains letters.
+            const digitCountMatch = errText.match(/(\d+)\s*-?\s*digit/i);
+            if (digitCountMatch) {
+              const len = parseInt(digitCountMatch[1], 10);
+              const digitsOnlyVal = cur.replace(/\D/g, '').slice(0, len).padEnd(len, '0');
+              if (digitsOnlyVal !== cur) localFixes.push({ id: fld.id, value: digitsOnlyVal });
+              continue;
+            }
             const cleaned = cur.replace(/[^A-Za-z0-9]/g, '');
             if (cleaned !== cur && cleaned.length > 0) {
               localFixes.push({ id: fld.id, value: cleaned });
@@ -1760,12 +1788,18 @@ export class FormFiller {
           }
 
           // --------------------------------------------------
-          // Digits only: strip non-digits
+          // Digits only / N-digit code: strip non-digits, and pad/truncate
+          // to an explicit count when the message states one (e.g. "Enter
+          // 5 digit code", "6 digit OTP"). Phone/ZIP/SSN-specific messages
+          // are already handled by the branches above this one.
           // --------------------------------------------------
-          if (/only.*digits|digits only|must contain only digits/i.test(errText)) {
+          if (/only.*digits|digits only|must contain only digits|\d+\s*-?\s*digit/i.test(errText)) {
             const cleaned = cur.replace(/\D/g, '');
-            if (cleaned !== cur && cleaned.length > 0) {
-              localFixes.push({ id: fld.id, value: cleaned });
+            const msgLenMatch = errText.match(/(\d+)\s*-?\s*digit/i);
+            const targetLen = msgLenMatch ? parseInt(msgLenMatch[1], 10) : null;
+            const fixed = targetLen != null ? cleaned.slice(0, targetLen).padEnd(targetLen, '0') : cleaned;
+            if (fixed !== cur && fixed.length > 0) {
+              localFixes.push({ id: fld.id, value: fixed });
             }
             continue;
           }
@@ -1820,23 +1854,22 @@ export class FormFiller {
           }
         }
 
+        // Merge local fixes into recoveryFields rather than applying them
+        // separately — this lets the single refill pass below handle
+        // background- and locally-resolved fields uniformly in one go.
         if (localFixes.length > 0) {
-          retries++;
+          try { console.info('[FDF] local fixes merged into recovery:', localFixes.map(l => ({ id: l.id, value: l.value }))); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
           for (const fix of localFixes) {
-            const fld = formAnalysis.fields.find((f) => f.id === fix.id);
-            if (!fld) continue;
-            const el = this.resolveElement(fld.selector);
-            if (!el) continue;
-            const success = await this.fillField(el, { ...fld, value: fix.value });
-            if (success) filledSet.add(fld.id);
-            await this.sleep(interFieldDelay);
+            if (!resolvedFieldIds.has(fix.id)) {
+              recoveryFields.push({ field: fix.id, value: fix.value });
+              resolvedFieldIds.add(fix.id);
+            }
           }
-          // continue to next attempt to let validators run
-          try { console.info('[FDF] applied local fixes:', localFixes.map(l => ({ id: l.id, value: l.value }))); } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
-          continue;
         }
+      }
 
-        // If no local fixes, give up contacting background
+      if (recoveryFields.length === 0) {
+        // Neither background nor local heuristics resolved anything this round.
         break;
       }
 
@@ -1855,22 +1888,15 @@ export class FormFiller {
         const el = this.resolveElement(fieldAnalysis.selector);
         if (!el) continue;
 
-        // Skip if the field's current value already passes HTML5 validation
-        // to avoid overwriting valid data with a different (but also valid) value.
-        // BUT: don't skip if the input itself carries a server-side error class.
-        const input = el as HTMLInputElement;
-        const hasServerErr = input.classList?.contains('error-input')
-          || input.classList?.contains('is-invalid')
-          || input.classList?.contains('has-error')
-          || input.getAttribute('aria-invalid') === 'true';
-        if (!hasServerErr && input.value && typeof input.validity !== 'undefined' && input.validity.valid) {
-          // Also check that the form-group isn't marked as error
-          const container = el.closest('.form-group, .form-field, .field-group');
-          if (!container || !container.classList.contains('error')) {
-            continue;
-          }
-        }
-
+        // NOTE: we deliberately do NOT skip fields whose native HTML5
+        // constraint validity happens to be "valid" here. The line above
+        // already confirmed this exact field is in currentErrorIds — i.e.
+        // scanDomErrors found a live, visible error message associated with
+        // it in this very round. Most custom (JS-driven) validators never
+        // touch the input's HTML5 constraint attributes, so `validity.valid`
+        // is trivially true regardless of whether the site actually accepts
+        // the value; trusting it here would skip re-filling exactly the
+        // fields the recovery loop exists to fix.
         const success = await this.fillField(el, { ...fieldAnalysis, value: newValue });
         if (success) filledSet.add(fieldAnalysis.id);
         await this.sleep(interFieldDelay);

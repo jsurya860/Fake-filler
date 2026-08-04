@@ -140,7 +140,7 @@ export const ERROR_PATTERNS: Record<string, RegExp> = {
   age: /must be (at least )?\d+ years?|under ?age|age restriction|age requirement|\d+\s*years? (old|of age)|not old enough|too young|age must/i,
 
   // --- Zipcode / postal (before phone to prevent "5 digits" matching phone) ---
-  zipcode: /invalid (zip|postal)|zip\s*code.*(invalid|format|must|\d+ digit)|postal\s*code.*(invalid|format)|enter.*valid (zip|postal)|not a valid (zip|postal)/i,
+  zipcode: /invalid (zip|postal)|zip\s*code.*(invalid|format|must|\d+ digit)|postal\s*code.*(invalid|format)|enter.*valid (zip|postal)|not a valid (zip|postal)|\d+\s*-?\s*digit.*(zip|postal)/i,
 
   // --- Numeric range ---
   range: /must be between \d|out of range|minimum.*maximum|value.*\d.*and.*\d|greater than|less than|minimum value|maximum value|cannot exceed|too small|too large|must be at least \d|must be no more|must not be (less|greater|more)|below (\d|the min)|above (\d|the max)|lower\s*than|higher\s*than/i,
@@ -155,7 +155,11 @@ export const ERROR_PATTERNS: Record<string, RegExp> = {
   email: /invalid email|email already|email is (invalid|not valid)|valid email|not a valid email|email (address|format)|enter.*email|provide.*email|email.*incorrect/i,
 
   // --- Phone ---
-  phone: /invalid phone|phone number|must be \d+ digit|valid phone|not a valid phone|phone.*format|contact number|telephone.*invalid|mobile.*invalid|enter.*phone/i,
+  // Deliberately anchors the "N digit" phrasing to actual phone context —
+  // an unanchored `must be \d+ digit` also matches unrelated fields like
+  // "Routing number must be 9 digits" or "Enter 5 digit code", silently
+  // misclassifying them as phone numbers.
+  phone: /invalid phone|phone number|phone.*must be \d+ digit|must be \d+ digit.*phone|valid phone|not a valid phone|phone.*format|contact number|telephone.*invalid|mobile.*invalid|enter.*phone/i,
 
   // --- Date ---
   date: /invalid date|date format|must be a (valid )?date|date must|valid date|not a valid date|date is (invalid|not valid)|before today|after today|future date|past date|date.*required|date cannot be (in the past|in the future|before|after)/i,
@@ -173,7 +177,12 @@ export const ERROR_PATTERNS: Record<string, RegExp> = {
   lettersOnly: /only.*letters|letters only|alphabetic (only|characters)|must contain only letters|must be alphabetic|no numbers|cannot contain (numbers|digits)|only alphabetical|only contain.*alpha/i,
 
   // --- Digits only ---
-  digitsOnly: /only.*digits|digits only|numbers only|numeric only|must contain only (digits|numbers)|only numbers|only numeric|numeric characters only/i,
+  // The trailing `\d+\s*-?\s*digit` alternative is a generic catch-all for
+  // "Enter N digit code/OTP/PIN" style messages that name no specific field
+  // type (no zip/postal/phone keyword) — by the time classification reaches
+  // here, more specific digit-count patterns (zipcode, phone, age, range)
+  // have already matched and consumed those cases.
+  digitsOnly: /only.*digits|digits only|numbers only|numeric only|must contain only (digits|numbers)|only numbers|only numeric|numeric characters only|\d+\s*-?\s*digit/i,
 
   // --- No spaces ---
   noSpaces: /no spaces|cannot contain spaces|spaces\s*(not|aren't|are not)\s*allowed|must not contain spaces|without spaces|remove spaces|whitespace\s*(not|are not)\s*allowed|no whitespace/i,

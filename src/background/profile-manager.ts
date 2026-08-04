@@ -1,3 +1,4 @@
+import browser from 'webextension-polyfill';
 import type {
   Profile,
   ProfileData,
@@ -9,7 +10,7 @@ import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
 // ProfileManager
-// Profiles are stored as plaintext JSON in chrome.storage.local.
+// Profiles are stored as plaintext JSON in browser.storage.local.
 //
 // NOTE: A previous version applied AES-256-GCM encryption, but the key
 // material was stored alongside the ciphertext in the same storage area,
@@ -123,7 +124,7 @@ export class ProfileManager {
   async delete(id: string): Promise<void> {
     await this.ready;
     this.profiles.delete(id);
-    await chrome.storage.local.remove(STORAGE_KEYS.profileKey(id));
+    await browser.storage.local.remove(STORAGE_KEYS.profileKey(id));
     await this.saveProfileIds();
   }
 
@@ -172,18 +173,18 @@ export class ProfileManager {
   private async persistProfile(profile: Profile): Promise<void> {
     // Profiles are stored as plaintext JSON objects. The previous AES-GCM
     // encryption scheme offered no real security because the key was stored
-    // in the same chrome.storage.local namespace as the ciphertext.
-    await chrome.storage.local.set({ [STORAGE_KEYS.profileKey(profile.id)]: profile });
+    // in the same browser.storage.local namespace as the ciphertext.
+    await browser.storage.local.set({ [STORAGE_KEYS.profileKey(profile.id)]: profile });
   }
 
   private async loadAllProfiles(): Promise<void> {
-    const idsResult = await chrome.storage.local.get(STORAGE_KEYS.PROFILE_IDS);
+    const idsResult = await browser.storage.local.get(STORAGE_KEYS.PROFILE_IDS);
     const ids = (idsResult[STORAGE_KEYS.PROFILE_IDS] as string[] | undefined) ?? [];
 
     const keys = ids.map(STORAGE_KEYS.profileKey);
     if (keys.length === 0) return;
 
-    const stored = await chrome.storage.local.get(keys);
+    const stored = await browser.storage.local.get(keys);
 
     for (const id of ids) {
       const entry: unknown = stored[STORAGE_KEYS.profileKey(id)];
@@ -204,11 +205,11 @@ export class ProfileManager {
     }
 
     // Clean up legacy key material — it provided no real isolation.
-    try { await chrome.storage.local.remove(STORAGE_KEYS.ENCRYPTION_KEY); } catch (e) { logSwallowed('src/background/profile-manager.ts', e); }
+    try { await browser.storage.local.remove(STORAGE_KEYS.ENCRYPTION_KEY); } catch (e) { logSwallowed('src/background/profile-manager.ts', e); }
   }
 
   private async saveProfileIds(): Promise<void> {
-    await chrome.storage.local.set({
+    await browser.storage.local.set({
       [STORAGE_KEYS.PROFILE_IDS]: Array.from(this.profiles.keys()),
     });
   }

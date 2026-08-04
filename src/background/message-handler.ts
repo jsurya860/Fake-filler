@@ -1,3 +1,5 @@
+import browser from 'webextension-polyfill';
+import type { Runtime } from 'webextension-polyfill';
 import type {
   ExtensionMessage,
   ExtensionResponse,
@@ -20,7 +22,8 @@ import { deepClone, isLoopbackOrPrivateHostname } from '@/shared/utils';
 import { logSwallowed } from '@/shared/messaging';
 
 // =============================================================
-// MessageHandler – routes all chrome.runtime messages
+// MessageHandler – routes all runtime messages (browser.runtime, works
+// across Chrome/Firefox/Safari via the webextension-polyfill)
 // =============================================================
 
 export class MessageHandler {
@@ -95,25 +98,24 @@ export class MessageHandler {
   // Entry point
   // -----------------------------------------------------------
 
-  handle(
+  async handle(
     message: ExtensionMessage,
-    sender: chrome.runtime.MessageSender,
-    sendResponse: (response: ExtensionResponse) => void,
-  ): true {
+    sender: Runtime.MessageSender,
+  ): Promise<ExtensionResponse> {
     // Defense-in-depth: reject messages that didn't come from this
     // extension's own content scripts/popup. No `externally_connectable` or
     // `onMessageExternal` listener exists today, so this isn't reachable by
     // a malicious page yet — but it's a cheap guard against that ever
     // becoming true by accident in a future change.
-    if (sender.id !== chrome.runtime.id) {
-      sendResponse({ success: false, error: 'Untrusted sender' });
-      return true;
+    if (sender.id !== browser.runtime.id) {
+      return { success: false, error: 'Untrusted sender' };
     }
-    this.dispatch(message)
-      .then((data) => sendResponse({ success: true, data }))
-      .catch((err: Error) => sendResponse({ success: false, error: err.message }));
-    // Return true to keep the message channel open for async responses
-    return true;
+    try {
+      const data = await this.dispatch(message);
+      return { success: true, data };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
   }
 
   // -----------------------------------------------------------
@@ -283,7 +285,7 @@ export class MessageHandler {
   }
 
   // Public helper to allow direct calls from the background service worker
-  // without going through chrome.runtime messaging. Returns the enriched form.
+  // without going through runtime messaging. Returns the enriched form.
   async generateDataForFormDirect(
     formAnalysis: FormAnalysis,
     profileId?: string,
@@ -297,7 +299,7 @@ export class MessageHandler {
   // -----------------------------------------------------------
 
   private async loadSettings(): Promise<void> {
-    const stored = await chrome.storage.local.get('settings');
+    const stored = await browser.storage.local.get('settings');
     if (stored.settings && typeof stored.settings === 'object') {
       // Only merge known setting keys with expected types to prevent
       // tampered or outdated storage entries from injecting arbitrary values.
@@ -316,7 +318,7 @@ export class MessageHandler {
   }
 
   private async persistSettings(): Promise<void> {
-    await chrome.storage.local.set({ settings: this.settings });
+    await browser.storage.local.set({ settings: this.settings });
   }
 
   // -----------------------------------------------------------

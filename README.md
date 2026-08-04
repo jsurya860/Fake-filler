@@ -13,9 +13,10 @@ A browser extension that intelligently fills web forms with realistic fake data 
 | **Consistent persona** | Name, email, username all derived from the same generated identity |
 | **Error recovery** | Detects validation errors after submission, classifies them, and auto-retries affected fields — **opt-in**, off by default (`errorRecoveryEnabled`) |
 | **Multi-step chaining** | Auto-fills forms across page navigations/SPA steps until disabled or a step limit is reached — opt-in (`chainingEnabled`) |
-| **Local profiles** | Save, edit, import/export named field-value sets in `chrome.storage.local`; stored as plain JSON, not encrypted (see Security Model) |
+| **Local profiles** | Save, edit, import/export named field-value sets in `browser.storage.local`; stored as plain JSON, not encrypted (see Security Model) |
 | **React popup** | Preview and edit every field value before filling; per-field skip controls |
 | **Manifest V3** | Built on the latest Chrome Extension standard for forward compatibility |
+| **Cross-browser** | Chrome/Edge/Brave/Opera (and any other Chromium browser) and Firefox both build and run from the same source, via `webextension-polyfill` — see [Cross-Browser Support](#cross-browser-support) |
 | **No telemetry by default** | No outbound network calls unless you explicitly opt in and configure your own endpoint (see Security Model) |
 
 ---
@@ -45,8 +46,8 @@ fake-filler/
 │   │   ├── index.ts            # Entry – message listener, chaining state, action-click handler
 │   │   ├── data-generator.ts   # Faker.js-backed data generation per field type
 │   │   ├── error-recovery.ts   # Error classification & recovery actions
-│   │   ├── profile-manager.ts  # Profile CRUD (plaintext JSON in chrome.storage.local)
-│   │   └── message-handler.ts  # Routes chrome.runtime messages
+│   │   ├── profile-manager.ts  # Profile CRUD (plaintext JSON in browser.storage.local)
+│   │   └── message-handler.ts  # Routes browser.runtime messages
 │   │
 │   ├── content/                # Injected into web pages
 │   │   ├── index.ts            # Entry – detection, filling, error observation, hotkey, modal handling
@@ -69,7 +70,7 @@ fake-filler/
 │           └── SettingsPanel.tsx   # All extension settings with toggle switches
 │
 └── tests/
-    ├── setup.ts                    # Chrome API + crypto stubs for Jest
+    ├── setup.ts                    # chrome/browser API + crypto stubs for Jest
     └── unit/                       # 18 suites — unit + integration (see `npm test`)
 ```
 
@@ -78,9 +79,39 @@ fake-filler/
 `manifest.json` declares **two** content scripts on `<all_urls>`:
 
 - `src/content/index.ts` — the main script, in the isolated world (Chrome's default). Owns detection, filling, the hotkey, and modal handling.
-- `src/content/api-interceptor-main.ts` — injected into the page's **MAIN world** (`"world": "MAIN"`, requires Chrome 111+) so it can patch the page's *real* `fetch`/`XMLHttpRequest`. The isolated world has its own separate copies of those globals that the page never calls, so this patch would be a no-op there.
+- `src/content/api-interceptor-main.ts` — injected into the page's **MAIN world** (`"world": "MAIN"`, requires Chrome 111+ / Firefox 128+) so it can patch the page's *real* `fetch`/`XMLHttpRequest`. The isolated world has its own separate copies of those globals that the page never calls, so this patch would be a no-op there.
 
 The two worlds don't share JS state, so captured API errors cross back to the isolated-world script via a `CustomEvent` on `window` (`API_ERROR_EVENT` in `api-interceptor.ts`) rather than a shared module import.
+
+---
+
+## Cross-Browser Support
+
+All extension code calls the standard, promise-based `browser.*` API via [`webextension-polyfill`](https://github.com/mozilla/webextension-polyfill) rather than `chrome.*` directly — this is what makes a single source tree buildable for both Chrome-family and Firefox targets.
+
+| Browser | Status |
+|---|---|
+| Chrome, Edge, Brave, Opera, Vivaldi, Arc (any Chromium browser) | Fully supported — `npm run build`, load `dist/` unpacked |
+| Firefox | Fully supported — `npm run build:firefox`, load `dist-firefox/manifest.json` as a temporary add-on. Requires Firefox 128+ (the version floor is set by the MAIN-world content script above; everything else works on older MV3-capable Firefox) |
+| Safari | **Not buildable from this repo alone.** Safari Web Extensions must be wrapped into a native Xcode project via Apple's `safari-web-extension-converter`, which requires a Mac with Xcode installed. The source itself avoids Chrome-only APIs (everything goes through the same `browser.*` surface Safari also implements natively), but producing and testing an actual `.app` bundle is a manual step outside this build pipeline. See [Building for Safari](#building-for-safari) below. |
+
+### Building for Firefox
+
+```bash
+npm run build:firefox
+```
+
+Output lands in `dist-firefox/`. In Firefox, go to `about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `dist-firefox/manifest.json`. (Temporary add-ons are removed when Firefox restarts — for a permanent install, the extension needs to be signed by [addons.mozilla.org](https://addons.mozilla.org/), which requires setting a real `gecko.id` in `vite.config.ts`'s manifest override — the current `fake-data-filler-pro@example.com` is a placeholder.)
+
+### Building for Safari
+
+1. Run `npm run build:firefox` (or `build:chrome`) to produce a standard, buildable extension folder — Safari's manifest requirements are closest to the Firefox target.
+2. On a Mac, run Apple's converter against that output:
+   ```bash
+   xcrun safari-web-extension-converter dist-firefox --project-location ./safari-project
+   ```
+3. Open the generated Xcode project, resolve any signing/entitlement prompts, and build/run it there.
+4. Test thoroughly — Safari's MV3 support (service workers, the `scripting` API, content-script world isolation) has enough behavioral differences from Chrome/Firefox that things may need adjustment; this path has not been exercised or verified as part of this project.
 
 ---
 
@@ -89,7 +120,7 @@ The two worlds don't share JS state, so captured API errors cross back to the is
 ### Prerequisites
 - Node.js 20+
 - npm 10+
-- Chrome 111+ (required for the MAIN-world content script — see above)
+- Chrome 111+, or Firefox 128+ (required for the MAIN-world content script — see above; see [Cross-Browser Support](#cross-browser-support) for Safari)
 
 ### Install dependencies
 
@@ -108,10 +139,12 @@ This runs Vite in `--watch` mode and rebuilds on every change to `src/`.
 ### Production build
 
 ```bash
-npm run build
+npm run build            # Chrome/Edge/Brave/etc. -> dist/
+npm run build:firefox    # Firefox -> dist-firefox/
+npm run build:all        # both
 ```
 
-Output lands in `dist/`. Load it as an unpacked extension in Chrome.
+See [Cross-Browser Support](#cross-browser-support) for Safari and details on the two targets.
 
 ### Load in Chrome
 
@@ -146,18 +179,18 @@ npm run validate          # typecheck + lint + test (CI gate)
 │  Popup (React 18)                                          │
 │  App.tsx ─► FormPreview │ ProfileSelector │ SettingsPanel  │
 └───────────────────────┬────────────────────────────────────┘
-                        │ chrome.runtime.sendMessage
+                        │ browser.runtime.sendMessage
                         ▼
 ┌────────────────────────────────────────────────────────────┐
 │  Background Service Worker (MV3)                           │
 │  message-handler.ts                                        │
 │   ├─ data-generator.ts   (Faker.js, locale-aware)          │
-│   ├─ profile-manager.ts  (plaintext JSON, chrome.storage)  │
+│   ├─ profile-manager.ts  (plaintext JSON, browser.storage) │
 │   └─ error-recovery.ts   (classify, recover, learn)        │
 │  index.ts also enforces the domain blocklist before        │
 │  dispatching any fill — see Security Model                 │
 └───────────────────────┬────────────────────────────────────┘
-                        │ chrome.tabs.sendMessage
+                        │ browser.tabs.sendMessage
                         ▼
 ┌────────────────────────────────────────────────────────────┐
 │  Content Scripts (injected into web pages)                 │
@@ -169,7 +202,7 @@ npm run validate          # typecheck + lint + test (CI gate)
 │  api-interceptor-main.ts (MAIN world) – real fetch/XHR       │
 │    error capture, bridged back via a CustomEvent             │
 └───────────────────────┬────────────────────────────────────┘
-                        │ chrome.storage.local (plaintext)
+                        │ browser.storage.local (plaintext)
                         ▼
 ┌────────────────────────────────────────────────────────────┐
 │  Local Storage                                              │
@@ -219,7 +252,7 @@ Phone number formats are locale-specific. Address and date formatting are not ye
 
 - **No remote code** — CSP blocks all external scripts (`script-src 'self'; object-src 'self'`)
 - **Minimal declared permissions** — `activeTab`, `scripting`, `storage`; no `host_permissions` entries. The content scripts do run on `<all_urls>` (required for the core fill feature to work on any site), which is a real, broad capability even though it isn't a separate `host_permissions` grant.
-- **Not encrypted at rest** — profiles are stored as plain JSON in `chrome.storage.local`. An earlier AES-256-GCM scheme was removed because the encryption key was stored in the same storage area as the ciphertext, which provided no real protection against anything with access to that storage — not stronger than plaintext in practice. If you need encryption-at-rest guarantees, don't store sensitive real data in profiles; they're meant for fake/test data.
+- **Not encrypted at rest** — profiles are stored as plain JSON in `browser.storage.local`. An earlier AES-256-GCM scheme was removed because the encryption key was stored in the same storage area as the ciphertext, which provided no real protection against anything with access to that storage — not stronger than plaintext in practice. If you need encryption-at-rest guarantees, don't store sensitive real data in profiles; they're meant for fake/test data.
 - **No telemetry by default** — `telemetryEnabled` defaults to `false` and there's no fixed collection endpoint; if you opt in, you provide your own HTTPS endpoint and only aggregate, scrubbed statistics (no field values, no selectors) are POSTed to it. The endpoint is rejected if it isn't HTTPS or resolves to a loopback/private-network address.
 - **XSS safe** — React's auto-escaping + no `dangerouslySetInnerHTML` + no `eval()`
 - **Domain blocklist** — hard-coded defaults for banking sites (`paypal.com`, `chase.com`, etc.), user-configurable. Enforced at every entry point that can trigger a fill — toolbar click, hotkey, multi-step chaining, and the content script's own message dispatcher — not just one of them.
@@ -240,7 +273,8 @@ The thresholds in `jest.config.ts` are a regression floor, not an aspirational t
 - **Multi-step form tracking across page navigations** — done (see `chainingEnabled` in Settings), not just planned
 - **Locale-aware address & date formatting** — close the gap noted above under Supported Locales
 - **Shadow DOM & Web Components support** — not started
-- **Firefox + Edge release** — blocked on adopting `webextension-polyfill`; the codebase is currently hard-wired to `chrome.*` APIs throughout
+- **Firefox release** — done (see [Cross-Browser Support](#cross-browser-support)); Edge/Brave/Opera already worked as Chromium browsers. Remaining: pick a real `gecko.id` and get the extension signed on addons.mozilla.org
+- **Safari release** — source is Safari-ready (no Chrome-only APIs), but producing/testing an actual `.app` bundle requires a Mac + Xcode and hasn't been done; see [Building for Safari](#building-for-safari)
 - **TensorFlow.js ML field detection** — under re-evaluation; the current 5-layer heuristic detector already exceeds the coverage this was originally meant to add, so this may be dropped rather than built
 - **Under consideration**: undo-last-fill, first-class same-site iframe payment fill (today this falls back to a copy-to-clipboard flow), per-site custom field-type rules, CSV/bulk profile import, popup UI localization
 

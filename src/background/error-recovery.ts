@@ -1,3 +1,4 @@
+import browser from 'webextension-polyfill';
 import type {
   ErrorInfo,
   ErrorMessage,
@@ -88,13 +89,20 @@ export class ErrorRecoveryEngine {
       actions.push(action);
 
       if (action.action !== 'manual' && action.action !== 'skip' && targetField) {
-        // "Code" fields must always produce varchar (alphanumeric), never names/words
+        // A message-driven value the classifier already computed (e.g. a
+        // digit-count-aware "5 digit code" fix, or a parsed length hint) is
+        // authoritative — it must win over the generic "code fields produce
+        // varchar" fallback below, which knows nothing about what the
+        // specific error message actually asked for.
         let newValue: string | undefined | null;
-        if (this.generator.isCodeField(targetField)) {
+        if (action.newValue) {
+          newValue = action.newValue;
+        } else if (this.generator.isCodeField(targetField)) {
+          // "Code" fields must always produce varchar (alphanumeric), never names/words
           newValue = this.generator.generateVarchar(targetField.constraints);
         } else {
           // Use generateWithRetry to produce a value that respects field constraints + pattern
-          newValue = action.newValue ?? this.generator.generateWithRetry(targetField, null, 5);
+          newValue = this.generator.generateWithRetry(targetField, null, 5);
         }
         if (newValue) {
           updatedFields.push({ field: targetField.id, value: newValue });
@@ -127,7 +135,7 @@ export class ErrorRecoveryEngine {
 
   private async recordTelemetry(payload: { attempted: number; successful: number; manual: number; timestamp: string }): Promise<void> {
     try {
-      const stored = await chrome.storage.local.get(STORAGE_KEYS.TELEMETRY);
+      const stored = await browser.storage.local.get(STORAGE_KEYS.TELEMETRY);
       const current = (stored[STORAGE_KEYS.TELEMETRY] as
         | { recoveries: number; successes: number; manual: number; lastRun: string | null }
         | undefined) ?? { recoveries: 0, successes: 0, manual: 0, lastRun: null };
@@ -137,7 +145,7 @@ export class ErrorRecoveryEngine {
         manual: (current.manual ?? 0) + (payload.manual ?? 0),
         lastRun: payload.timestamp,
       };
-      await chrome.storage.local.set({ [STORAGE_KEYS.TELEMETRY]: updated });
+      await browser.storage.local.set({ [STORAGE_KEYS.TELEMETRY]: updated });
       try { console.info('[FDF Telemetry] recovery', updated); } catch (e) { try { console.debug('[FDF Pro] telemetry info log failed', e); } catch (e) { logSwallowed('src/background/error-recovery.ts', e); } }
     } catch (err) {
       try { console.warn('[FDF Telemetry] failed to record', err); } catch (e) { try { console.debug('[FDF Pro] telemetry warn log failed', e); } catch (e) { logSwallowed('src/background/error-recovery.ts', e); } }
@@ -209,11 +217,32 @@ export class ErrorRecoveryEngine {
 
       case 'length': {
         const lengthHint = this.parseLengthHint(msg.text);
+        // The error message's stated length is more authoritative than the
+        // DOM's minLength/maxLength (which may be absent or simply not what
+        // the site's own JS validator is actually enforcing) — build the
+        // fresh value against the message-derived bounds directly, rather
+        // than returning only `constraints` and letting the caller fall back
+        // to generateWithRetry() against the (possibly unrelated) DOM
+        // constraints, which can silently regenerate a value that still
+        // doesn't satisfy what the message asked for.
+        let newValue: string | undefined;
+        if (field && (lengthHint.minLength != null || lengthHint.maxLength != null)) {
+          const mergedField: FieldAnalysis = {
+            ...field,
+            constraints: {
+              ...field.constraints,
+              minLength: lengthHint.minLength ?? field.constraints?.minLength ?? null,
+              maxLength: lengthHint.maxLength ?? field.constraints?.maxLength ?? null,
+            },
+          };
+          newValue = this.generator.generateWithRetry(mergedField, null, 5) ?? undefined;
+        }
         return {
           action: 'regenerate',
           field: fieldId,
           strategy: `Adjust length to ${lengthHint.minLength ?? '?'}–${lengthHint.maxLength ?? '?'} chars`,
           constraints: lengthHint,
+          newValue,
           retryCount,
         };
       }
@@ -350,12 +379,17 @@ export class ErrorRecoveryEngine {
       }
 
       case 'digitsOnly': {
-        const len = field?.constraints?.maxLength ?? 6;
+        // Prefer the count the error message itself states (e.g. "Enter 5
+        // digit code", "6 digit OTP") over the DOM's maxLength, which is
+        // frequently absent for fields validated purely in JS (OTP/PIN/code
+        // inputs rarely carry a maxlength attribute at all).
+        const msgLenHint = msg.text.match(/(\d+)\s*-?\s*digit/i);
+        const len = msgLenHint ? parseInt(msgLenHint[1], 10) : (field?.constraints?.maxLength ?? 6);
         const value = Array.from({ length: Math.min(len, 20) }, () => String(Math.floor(Math.random() * 10))).join('');
         return {
           action: 'regenerate',
           field: fieldId,
-          strategy: 'Regenerate digits-only value',
+          strategy: `Regenerate ${len}-digit value`,
           newValue: value,
           retryCount,
         };
@@ -393,14 +427,21 @@ export class ErrorRecoveryEngine {
         };
       }
 
-      case 'zipcode':
+      case 'zipcode': {
+        // Prefer the length the error message itself states (e.g. "Enter 5
+        // digit zip code") over an assumed 5 — some locales require 6
+        // (India, Canada without letters) or other lengths.
+        const zipLenHint = msg.text.match(/(\d+)\s*-?\s*digit/i);
+        const zipLen = zipLenHint ? parseInt(zipLenHint[1], 10) : 5;
+        const zipValue = Array.from({ length: zipLen }, () => String(Math.floor(Math.random() * 10))).join('');
         return {
           action: 'regenerate',
           field: fieldId,
-          strategy: 'Regenerate valid ZIP code',
-          newValue: String(Math.floor(Math.random() * 90000) + 10000),
+          strategy: `Regenerate valid ${zipLen}-digit ZIP code`,
+          newValue: zipValue,
           retryCount,
         };
+      }
 
       case 'pattern': {
         // Pattern mismatch – regenerate with constraints; the content-script local fix
@@ -544,7 +585,7 @@ export class ErrorRecoveryEngine {
       this.learningDb = this.learningDb.slice(-500);
     }
 
-    await chrome.storage.local.set({ [STORAGE_KEYS.ERROR_LEARNING]: this.learningDb });
+    await browser.storage.local.set({ [STORAGE_KEYS.ERROR_LEARNING]: this.learningDb });
  }
 
   private async recordLearning(
@@ -566,11 +607,11 @@ export class ErrorRecoveryEngine {
       this.learningDb = this.learningDb.slice(-500);
     }
 
-    await chrome.storage.local.set({ [STORAGE_KEYS.ERROR_LEARNING]: this.learningDb });
+    await browser.storage.local.set({ [STORAGE_KEYS.ERROR_LEARNING]: this.learningDb });
   }
 
   private async loadLearningDb(): Promise<void> {
-    const stored = await chrome.storage.local.get(STORAGE_KEYS.ERROR_LEARNING);
+    const stored = await browser.storage.local.get(STORAGE_KEYS.ERROR_LEARNING);
     this.learningDb =
       (stored[STORAGE_KEYS.ERROR_LEARNING] as ErrorLearningEntry[] | undefined) ?? [];
   }

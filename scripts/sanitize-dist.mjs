@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 
 const root = process.cwd();
-const distDir = path.join(root, 'dist');
+const distDir = path.join(root, process.argv[2] || 'dist');
 
 async function sanitizeFile(filePath) {
   try {

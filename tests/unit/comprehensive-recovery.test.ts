@@ -152,6 +152,13 @@ describe('classifyError covers all ErrorType values', () => {
     ['Must contain only digits', 'digitsOnly'],
     ['Digits only please', 'digitsOnly'],
     ['Only numbers are allowed', 'digitsOnly'],
+    // Generic "N digit X" messages that name no specific field type (no
+    // zip/postal/phone keyword) must fall through to digitsOnly rather
+    // than 'unknown' — and must NOT be misclassified as 'phone' just
+    // because they contain "N digit".
+    ['Enter 5 digit code', 'digitsOnly'],
+    ['Please enter a 6 digit OTP', 'digitsOnly'],
+    ['Routing number must be 9 digits', 'digitsOnly'],
 
     // noSpaces
     ['Spaces are not allowed', 'noSpaces'],
@@ -170,6 +177,7 @@ describe('classifyError covers all ErrorType values', () => {
     ['Enter a valid zip code', 'zipcode'],
     ['Invalid postal code', 'zipcode'],
     ['ZIP code must be 5 digits', 'zipcode'],
+    ['Enter 5 digit zip code', 'zipcode'],
 
     // range
     ['Value must be greater than 0', 'range'],
@@ -344,6 +352,36 @@ describe('buildRecoveryAction produces correct strategies', () => {
     expect(result.success).toBe(true);
     expect(result.updatedFields[0].value).toMatch(/^\d{5}$/);
   });
+
+  it('zipcode → honors an explicit digit count stated in the error message', async () => {
+    const result = await engine.recover(
+      { hasError: true, messages: [{ text: 'Enter 6 digit zip code', fieldName: 'zip', fieldId: 'zip-1', type: 'zipcode', elementSelector: '' }], affectedFields: ['zip'], severity: 'low' },
+      [makeField({ id: 'zip-1', name: 'zip', type: 'zipcode' })],
+    );
+    expect(result.success).toBe(true);
+    expect(result.updatedFields[0].value).toMatch(/^\d{6}$/);
+  });
+
+  it('digitsOnly → honors an explicit digit count for a generic "N digit code" message', async () => {
+    const result = await engine.recover(
+      { hasError: true, messages: [{ text: 'Enter 5 digit code', fieldName: 'otp', fieldId: 'otp-1', type: 'digitsOnly', elementSelector: '' }], affectedFields: ['otp'], severity: 'low' },
+      [makeField({ id: 'otp-1', name: 'otp', type: 'text' })],
+    );
+    expect(result.success).toBe(true);
+    expect(result.updatedFields[0].value).toMatch(/^\d{5}$/);
+  });
+
+  it('a field literally named "code" still gets a pure N-digit value when the message states one', async () => {
+    // isCodeField() would otherwise force a generic letter+digit varchar
+    // (e.g. "AB0423") for any field named/labeled "code" — but the message
+    // explicitly asks for a 5-digit numeric value, which must win.
+    const result = await engine.recover(
+      { hasError: true, messages: [{ text: 'Enter 5 digit code', fieldName: 'verificationCode', fieldId: 'vc-1', type: 'digitsOnly', elementSelector: '' }], affectedFields: ['verificationCode'], severity: 'low' },
+      [makeField({ id: 'vc-1', name: 'verificationCode', label: 'Verification Code', type: 'text' })],
+    );
+    expect(result.success).toBe(true);
+    expect(result.updatedFields[0].value).toMatch(/^\d{5}$/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -489,6 +527,17 @@ describe('Local fix handlers in fillFormWithRecovery', () => {
     expect(val).toMatch(/^\d{3,5}/);
   });
 
+  it('a field named "code" gets a pure N-digit value (not letters+digits) when the message states a digit count', async () => {
+    buildDom(
+      '<input id="testInput" type="text" class="error-input" value="ab" />',
+      'Enter 5 digit code',
+    );
+    const form = makeFormForLocalFix({ type: 'text', htmlType: 'text', name: 'verificationCode', label: 'Verification Code' });
+    await filler.fillFormWithRecovery(form, { maxRetries: 1 });
+    const val = (document.querySelector('#testInput') as HTMLInputElement).value;
+    expect(val).toMatch(/^\d{5}$/);
+  });
+
   it('no spaces: strips all whitespace', async () => {
     buildDom(
       '<input id="testInput" type="text" class="error-input" value="hello world test" />',
@@ -612,5 +661,137 @@ describe('parseLengthHint and parseRangeHint via recovery', () => {
       [makeField({ id: 'n-1', type: 'number' })],
     );
     expect(Number(result.updatedFields[0].value)).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. INITIAL FILL — leading zeros must survive on digit-string fields
+// ---------------------------------------------------------------------------
+
+describe('fillField preserves leading zeros on digit-string fields', () => {
+  it('does not strip leading zeros from a ZIP field with inputmode="numeric"', async () => {
+    document.body.innerHTML = '<input id="zipInput" name="zip" inputmode="numeric" />';
+    const filler = new FormFiller();
+    const el = document.querySelector('#zipInput') as HTMLInputElement;
+    const field = makeField({ id: 'zip-1', name: 'zip', type: 'zipcode', htmlType: 'text', value: '00034' });
+
+    await filler.fillField(el, field);
+
+    expect(el.value).toBe('00034');
+  });
+
+  it('does not strip leading zeros from a phone field with inputmode="numeric"', async () => {
+    document.body.innerHTML = '<input id="phoneInput" name="phone" type="tel" inputmode="numeric" />';
+    const filler = new FormFiller();
+    const el = document.querySelector('#phoneInput') as HTMLInputElement;
+    const field = makeField({ id: 'phone-1', name: 'phone', type: 'phone', htmlType: 'tel', value: '0526234601' });
+
+    await filler.fillField(el, field);
+
+    expect(el.value).toBe('0526234601');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. RECOVERY must not trust native HTML5 validity over a visible custom error
+// ---------------------------------------------------------------------------
+
+describe('scanDomErrors and recovery trust a visible custom-validated error over HTML5 validity', () => {
+  it('scanDomErrors reports an error even when the input has none of the recognized error classes', () => {
+    document.body.innerHTML = `
+      <div class="grp">
+        <input id="zipInput" name="zip" type="text" value="12" />
+        <div role="alert">Enter 5 digit zip code</div>
+      </div>
+    `;
+    const filler = new FormFiller();
+    const fields = [{ id: 'zip-1', selector: '#zipInput', name: 'zip', label: 'Zip' }];
+
+    const errors = filler.scanDomErrors(fields);
+
+    expect(errors.some((e) => e.nearFieldId === 'zip-1')).toBe(true);
+  });
+
+  it('fillFormWithRecovery re-fills a field flagged with an error despite HTML5 validity being true', async () => {
+    document.body.innerHTML = `
+      <div class="grp">
+        <input id="zipInput" name="zip" type="text" value="12" />
+        <div role="alert">Enter 5 digit zip code</div>
+      </div>
+    `;
+    (global as any).chrome.runtime.sendMessage = jest.fn(async () => ({ success: false, error: 'no background' }));
+
+    const filler = new FormFiller();
+    const field = makeField({
+      id: 'zip-1', name: 'zip', label: 'Zip', type: 'zipcode', htmlType: 'text',
+      selector: '#zipInput', value: '12',
+    });
+    const form = makeFormAnalysis([field]);
+
+    await filler.fillFormWithRecovery(form, { maxRetries: 2 });
+
+    const finalValue = (document.querySelector('#zipInput') as HTMLInputElement).value;
+    expect(finalValue).toMatch(/^\d{5}$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. RECOVERY must not let one background-resolved field starve the others
+// ---------------------------------------------------------------------------
+
+describe('fillFormWithRecovery merges local fixes with a partial background recovery', () => {
+  it('still applies a local fix to a field the background did not resolve this round', async () => {
+    document.body.innerHTML = `
+      <form id="f">
+        <div class="grp">
+          <input id="ssnInput" name="ssn" type="text" value="123456789" />
+          <div role="alert">SSN must be in format NNN-NN-NNNN</div>
+        </div>
+        <div class="grp">
+          <input id="zipInput" name="zip" type="text" value="12" />
+          <div role="alert">Enter 5 digit zip code</div>
+        </div>
+      </form>
+    `;
+
+    // Simulate the background resolving ONLY the zip field this round —
+    // the SSN field's error is left for local heuristics to fix.
+    (global as any).chrome.runtime.sendMessage = jest.fn(async (msg: { action: string }) => {
+      if (msg.action === 'DETECT_ERRORS') {
+        return {
+          success: true,
+          data: {
+            errorInfo: { hasError: true, messages: [], affectedFields: [], severity: 'low' },
+            recovery: {
+              success: true,
+              actions: [],
+              updatedFields: [{ field: 'zip-1', value: '54321' }],
+              requiresManualIntervention: false,
+            },
+          },
+        };
+      }
+      return { success: false, error: 'unhandled' };
+    });
+
+    const fields = [
+      makeField({ id: 'ssn-1', name: 'ssn', label: 'SSN', type: 'text', htmlType: 'text', selector: '#ssnInput', value: '123456789' }),
+      makeField({ id: 'zip-1', name: 'zip', label: 'Zip', type: 'zipcode', htmlType: 'text', selector: '#zipInput', value: '12' }),
+    ];
+    const form = makeFormAnalysis(fields);
+
+    const filler = new FormFiller();
+    await filler.fillFormWithRecovery(form, { maxRetries: 2 });
+
+    const ssnVal = (document.querySelector('#ssnInput') as HTMLInputElement).value;
+    const zipVal = (document.querySelector('#zipInput') as HTMLInputElement).value;
+
+    // Background-resolved field applied as-is.
+    expect(zipVal).toBe('54321');
+    // Local-fix-only field must ALSO be applied even though the background
+    // resolved a different field this round — this is the fix: a per-round
+    // all-or-nothing gate previously skipped local fixes entirely whenever
+    // ANY field got a background-provided value.
+    expect(ssnVal).toBe('123-45-6789');
   });
 });
