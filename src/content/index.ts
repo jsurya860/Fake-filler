@@ -1055,6 +1055,7 @@ async function dispatch(message: ExtensionMessage): Promise<unknown> {
       isFilling = true;
       const result = await filler.fillFormWithRecovery(formAnalysis, {
         maxRetries: maxRetries ?? 3,
+        onProgress: (msg) => showTransientToast(msg),
       });
 
       try { console.info('[FDF Pro] FILL_FORM result for selector', formAnalysis.selector, result); } catch (e) { logSwallowed('src/content/index.ts', e); }

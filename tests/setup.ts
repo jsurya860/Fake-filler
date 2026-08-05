@@ -129,6 +129,8 @@ try {
   const { FormFiller } = require('../src/content/form-filler');
   if (FormFiller && FormFiller.prototype) {
     FormFiller.prototype.interFieldDelayMs = 0;
+    FormFiller.prototype.domSettleQuietMs = 0;
+    FormFiller.prototype.domSettleMaxMs = 0;
   }
 } catch {
   // Not available in all test suites — safe to ignore

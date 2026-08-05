@@ -46,6 +46,17 @@ export class FormFiller {
    */
   interFieldDelayMs = 30;
 
+  /**
+   * Debounce window (ms) the recovery loop waits for after a (re)fill before
+   * scanning for validation errors — it resolves early as soon as the DOM
+   * goes quiet for this long, instead of always sleeping a fixed backoff.
+   * Set to 0 (with domSettleMaxMs) in tests for full-speed, deterministic runs.
+   */
+  domSettleQuietMs = 150;
+
+  /** Hard cap (ms) on the settle wait per attempt, in case a page mutates continuously (e.g. animations). */
+  domSettleMaxMs = 1500;
+
   // -----------------------------------------------------------
   // Fill all fields in a form analysis
   // -----------------------------------------------------------
@@ -993,6 +1004,53 @@ export class FormFiller {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // Waits for the given scope to go quiet (no DOM mutations) for `quietMs`,
+  // resolving early instead of always sleeping the full `timeoutMs`. Used by
+  // the recovery loop so it reacts as fast as the page's own validators do —
+  // a fast validator resolves in ~`quietMs`, a slow one still gets up to
+  // `timeoutMs` before the loop moves on and scans for errors anyway.
+  private waitForDomSettle(scope: Element | undefined, quietMs: number, timeoutMs: number): Promise<void> {
+    if (quietMs <= 0 && timeoutMs <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const target: Node = scope ?? document.body;
+      let settled = false;
+      let quietTimer: ReturnType<typeof setTimeout> | null = null;
+      let observer: MutationObserver | null = null;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        try { observer?.disconnect(); } catch (e) { logSwallowed('src/content/form-filler.ts:waitForDomSettle', e); }
+        if (quietTimer) clearTimeout(quietTimer);
+        clearTimeout(maxTimer);
+        resolve();
+      };
+
+      const scheduleQuiet = () => {
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(finish, quietMs);
+      };
+
+      try {
+        observer = new MutationObserver(scheduleQuiet);
+        observer.observe(target, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ['class', 'aria-invalid', 'style'],
+        });
+      } catch (e) {
+        logSwallowed('src/content/form-filler.ts:waitForDomSettle', e);
+      }
+
+      const maxTimer = setTimeout(finish, timeoutMs);
+      // Start the quiet window immediately so a page with no further
+      // mutations at all resolves after `quietMs`, not the full `timeoutMs`.
+      scheduleQuiet();
+    });
+  }
+
   // Simple stable selector helper used for debug logs
   private cssSelector(el: Element): string {
     try {
@@ -1228,10 +1286,11 @@ export class FormFiller {
 
   async fillFormWithRecovery(
     formAnalysis: FormAnalysis,
-    options: { maxRetries?: number; signal?: AbortSignal } = {},
+    options: { maxRetries?: number; signal?: AbortSignal; onProgress?: (message: string) => void } = {},
   ): Promise<{ filled: number; skipped: number; retries: number; finalErrors: string[] }> {
     const maxRetries = options.maxRetries ?? DEFAULT_SETTINGS.maxRetryAttempts ?? 3;
     const signal = options.signal;
+    const onProgress = options.onProgress;
     // Delay between field writes — use the configurable property (set to 0 in tests)
     const interFieldDelay = this.interFieldDelayMs;
     // Scope error queries to the form element for accuracy
@@ -1297,9 +1356,12 @@ export class FormFiller {
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (signal?.aborted) break;
-      // Exponential backoff before each attempt to give validators time (capped at 2 s)
-      const backoffMs = Math.min(200 * Math.pow(2, attempt), 2000);
-      await this.sleep(backoffMs);
+      // Wait for the page's own validation to settle (new error text,
+      // aria-invalid toggles, class changes) instead of blindly sleeping a
+      // fixed backoff — reacts as fast as the page's validators do. The cap
+      // still grows a little each attempt to give slower validators more room.
+      const settleTimeoutMs = Math.min(400 + attempt * 300, this.domSettleMaxMs);
+      await this.waitForDomSettle(formScope, this.domSettleQuietMs, settleTimeoutMs);
 
       const domErrors = this.scanDomErrors(formAnalysis.fields, formScope);
       // Only consider field-associated errors for recovery (ignore page-level messages)
@@ -1329,6 +1391,8 @@ export class FormFiller {
 
       try { console.info('[FDF] domErrors:', domErrors.length, '| fieldErrors:', fieldErrors.length, '| unassociated:', unassociated.length, fieldErrors.map(f => ({ id: f.fieldId, name: f.nearFieldName, text: f.text }))); } catch (e) { try { console.debug('[FDF Pro] debug log failed', e); } catch (e) { logSwallowed('src/content/form-filler.ts', e); } }
       if (fieldErrors.length === 0) break; // All field-level errors resolved
+
+      onProgress?.(`Fixing ${fieldErrors.length} field${fieldErrors.length === 1 ? '' : 's'}… (attempt ${attempt + 1}/${maxRetries})`);
 
       // Detect stagnation: same fields and same count failing despite retries
       const currentErrorIds = new Set(fieldErrors.map((e) => e.fieldId).filter(Boolean));
@@ -2029,6 +2093,15 @@ export class FormFiller {
         }
       } catch (e) { logSwallowed('src/content/form-filler.ts', e); }
     }
+
+    if (retries > 0) {
+      onProgress?.(
+        finalErrors.length === 0
+          ? 'Auto-recovery fixed all fields'
+          : `Auto-recovery couldn't fix ${finalErrors.length} field${finalErrors.length === 1 ? '' : 's'}`,
+      );
+    }
+
     const filled = filledSet.size;
     return { filled, skipped, retries, finalErrors };
   }
